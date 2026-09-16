@@ -1,0 +1,606 @@
+generator client {
+  provider = "prisma-client"
+  output = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+enum ReviewStatus {
+  NEW
+  NEEDS_DETAILS
+  REVIEWED
+}
+enum ObservationType {
+  SMOKE
+  FLAME
+  BURNING_SMELL
+}
+enum LocationMode {
+  INCIDENT_ESTIMATE
+  OBSERVER_POSITION
+}
+enum VerificationStatus {
+  UNVERIFIED
+  CONFIRMED_FIRE
+  NOT_FIRE
+}
+enum VerificationOutcome {
+  CONFIRMED_FIRE
+  NOT_FIRE
+  INCONCLUSIVE
+  CORRECTION
+}
+enum HandlingStatus {
+  OPEN
+  CHECK_SCHEDULED
+  ON_SCENE
+  RESPONDING
+  MONITORING
+  CLOSED
+}
+enum Priority {
+  HIGH
+  MEDIUM
+  LOW
+  UNASSESSED
+}
+enum AssignmentStatus {
+  ASSIGNED
+  ACCEPTED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+enum PublicationType {
+  UPDATE
+  ANNOUNCEMENT
+  WARNING
+  EDUCATION
+}
+enum PublicationStatus {
+  DRAFT
+  PUBLISHED
+  SUPERSEDED
+  WITHDRAWN
+}
+enum PublicLocationMode {
+  NONE
+  REGION_ONLY
+  APPROVED_INCIDENT_POINT
+}
+enum UploadState {
+  PENDING
+  FINALIZING
+  READY
+  ATTACHED
+  REJECTED
+  DELETING
+}
+enum RunStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+  OBSOLETE
+}
+enum EvidenceLevel {
+  LOW
+  MODERATE
+  HIGH
+  INSUFFICIENT_DATA
+}
+enum FieldFinding {
+  VISIBLE_FIRE
+  SMOKE_ONLY
+  NO_INDICATION
+  INCONCLUSIVE
+  UNREACHABLE
+}
+enum UpdateKind {
+  CLARIFICATION
+  REQUEST
+  CORRECTION
+}
+enum SubjectType {
+  TEAM
+  EQUIPMENT
+  FEATURE
+}
+enum FeatureKind {
+  BOUNDARY
+  FOREST
+  PEATLAND
+  SETTLEMENT
+  FACILITY
+  ROAD
+  RIVER
+  WATER_SOURCE
+  DESIGNATED_LOCATION
+}
+
+model MsUser {
+  id String @id
+  name String
+  email String @unique
+  emailVerified Boolean @default(false)
+  image String?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  role Role @default(USER)
+  active Boolean @default(true)
+  canConfirmIncidents Boolean @default(false)
+  canPublishInformation Boolean @default(false)
+  sessions TrSession[]
+  accounts TrAccount[]
+  reports TrReport[]
+  reportUpdates TrReportUpdate[]
+  fieldUpdates TrFieldUpdate[]
+  verifications TrVerification[]
+  attachments TrAttachment[] @relation("uploader")
+  approvals TrAttachment[] @relation("approver")
+  assignments TrAssignment[]
+  operationalUpdates TrOperationalUpdate[]
+  drafts TrPublicInformation[] @relation("author")
+  publications TrPublicInformation[] @relation("publisher")
+  audits TrAuditLog[]
+}
+model TrSession {
+  id String @id
+  expiresAt DateTime @db.Timestamptz(3)
+  token String @unique
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  ipAddress String?
+  userAgent String?
+  userId String
+  user MsUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId])
+}
+model TrAccount {
+  id String @id
+  accountId String
+  providerId String
+  userId String
+  user MsUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken String?
+  refreshToken String?
+  idToken String?
+  accessTokenExpiresAt DateTime? @db.Timestamptz(3)
+  refreshTokenExpiresAt DateTime? @db.Timestamptz(3)
+  scope String?
+  password String?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  @@unique([providerId, accountId])
+  @@index([userId])
+}
+model TrAuthVerification {
+  id String @id
+  identifier String
+  value String
+  expiresAt DateTime @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  @@index([identifier])
+}
+model TrReport {
+  id String @id @default(cuid())
+  number String @unique
+  reporterId String
+  reporter MsUser @relation(fields: [reporterId], references: [id], onDelete: Restrict)
+  observationTypes ObservationType[]
+  observedAt DateTime @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  locationMode LocationMode
+  latitude Float?
+  longitude Float?
+  accuracyMeters Float?
+  regionId String?
+  region MsRegion? @relation(fields: [regionId], references: [id], onDelete: Restrict)
+  locationDescription String
+  description String
+  reviewStatus ReviewStatus @default(NEW)
+  caseId String?
+  case TrCase? @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  idempotencyKey String
+  payloadHash String
+  updates TrReportUpdate[]
+  attachments TrAttachment[]
+  @@unique([reporterId, idempotencyKey])
+  @@index([reporterId, createdAt])
+  @@index([caseId, observedAt])
+  @@index([regionId])
+  @@index([reviewStatus, createdAt])
+}
+model TrReportUpdate {
+  id String @id @default(cuid())
+  reportId String
+  report TrReport @relation(fields: [reportId], references: [id], onDelete: Restrict)
+  authorId String
+  author MsUser @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  authorRole Role
+  kind UpdateKind @default(CLARIFICATION)
+  message String
+  publicToReporter Boolean @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  attachments TrAttachment[]
+  @@index([reportId, createdAt])
+  @@index([authorId])
+}
+model TrHotspot {
+  id String @id @default(cuid())
+  source String @default("NASA FIRMS")
+  product String
+  observationKey String @unique
+  satellite String
+  instrument String
+  latitude Float
+  longitude Float
+  acquiredAt DateTime @db.Timestamptz(3)
+  confidenceRaw String
+  frp Float?
+  version String?
+  raw Json
+  fetchedAt DateTime @default(now()) @db.Timestamptz(3)
+  caseId String?
+  case TrCase? @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  @@index([acquiredAt])
+  @@index([caseId])
+}
+model TrCase {
+  id String @id @default(cuid())
+  number String @unique
+  title String
+  latitude Float?
+  longitude Float?
+  regionId String?
+  region MsRegion? @relation(fields: [regionId], references: [id], onDelete: Restrict)
+  verificationStatus VerificationStatus @default(UNVERIFIED)
+  handlingStatus HandlingStatus @default(OPEN)
+  priority Priority @default(UNASSESSED)
+  priorityReason String?
+  version Int @default(1)
+  contextRevision Int @default(1)
+  latestAnalysisId String? @unique
+  latestAnalysis TrAnalysis? @relation("latestAnalysis", fields: [latestAnalysisId], references: [id], onDelete: Restrict)
+  openedAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  closedAt DateTime? @db.Timestamptz(3)
+  closureReason String?
+  reports TrReport[]
+  hotspots TrHotspot[]
+  fieldUpdates TrFieldUpdate[]
+  verifications TrVerification[]
+  assignments TrAssignment[]
+  analyses TrAnalysis[] @relation("caseAnalyses")
+  publications TrPublicInformation[]
+  @@index([regionId])
+  @@index([handlingStatus, priority, updatedAt])
+}
+model TrFieldUpdate {
+  id String @id @default(cuid())
+  caseId String
+  case TrCase @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  recorderId String
+  recorder MsUser @relation(fields: [recorderId], references: [id], onDelete: Restrict)
+  teamId String?
+  team MsTeam? @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  findings FieldFinding
+  description String
+  source String
+  observedAt DateTime @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  latitude Float?
+  longitude Float?
+  attachments TrAttachment[]
+  verifications TrVerification[]
+  @@index([caseId, observedAt])
+  @@index([recorderId])
+  @@index([teamId])
+}
+model TrVerification {
+  id String @id @default(cuid())
+  caseId String
+  case TrCase @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  decidingAdminId String
+  decidingAdmin MsUser @relation(fields: [decidingAdminId], references: [id], onDelete: Restrict)
+  fieldUpdateId String
+  fieldUpdate TrFieldUpdate @relation(fields: [fieldUpdateId], references: [id], onDelete: Restrict)
+  authorityReference String
+  outcome VerificationOutcome
+  previousStatus VerificationStatus
+  newStatus VerificationStatus
+  reason String
+  correctedDecisionId String?
+  correctedDecision TrVerification? @relation("correction", fields: [correctedDecisionId], references: [id], onDelete: Restrict)
+  corrections TrVerification[] @relation("correction")
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  @@index([caseId, createdAt])
+  @@index([decidingAdminId])
+  @@index([fieldUpdateId])
+  @@index([correctedDecisionId])
+}
+model TrAttachment {
+  id String @id @default(cuid())
+  objectKey String @unique
+  stagingKey String @unique
+  filename String
+  contentType String
+  detectedType String?
+  size Int
+  digest String?
+  uploaderId String
+  uploader MsUser @relation("uploader", fields: [uploaderId], references: [id], onDelete: Restrict)
+  state UploadState @default(PENDING)
+  expiresAt DateTime @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  reportId String?
+  report TrReport? @relation(fields: [reportId], references: [id], onDelete: Restrict)
+  reportUpdateId String?
+  reportUpdate TrReportUpdate? @relation(fields: [reportUpdateId], references: [id], onDelete: Restrict)
+  fieldUpdateId String?
+  fieldUpdate TrFieldUpdate? @relation(fields: [fieldUpdateId], references: [id], onDelete: Restrict)
+  publicationId String?
+  publication TrPublicInformation? @relation(fields: [publicationId], references: [id], onDelete: Restrict)
+  sourceAttachmentId String?
+  sourceAttachment TrAttachment? @relation("derivative", fields: [sourceAttachmentId], references: [id], onDelete: Restrict)
+  derivatives TrAttachment[] @relation("derivative")
+  publicationUseBasis String?
+  redactionReview String?
+  approvedById String?
+  approvedBy MsUser? @relation("approver", fields: [approvedById], references: [id], onDelete: Restrict)
+  approvedAt DateTime? @db.Timestamptz(3)
+  revokedAt DateTime? @db.Timestamptz(3)
+  @@index([uploaderId, state])
+  @@index([reportId])
+  @@index([reportUpdateId])
+  @@index([fieldUpdateId])
+  @@index([publicationId])
+  @@index([sourceAttachmentId])
+  @@index([approvedById])
+  @@index([state, expiresAt])
+}
+model MsRegion {
+  id String @id @default(cuid())
+  name String
+  level Int
+  code String @unique
+  bmkgAdm4 String? @unique
+  timezone String
+  parentId String?
+  parent MsRegion? @relation("regionTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children MsRegion[] @relation("regionTree")
+  datasetId String?
+  dataset MsMapLayer? @relation(fields: [datasetId], references: [id], onDelete: Restrict)
+  verifiedAt DateTime? @db.Timestamptz(3)
+  reports TrReport[]
+  cases TrCase[]
+  features MsMapFeature[]
+  forecasts TrWeatherForecast[]
+  publications TrPublicInformationRegion[]
+  @@index([parentId])
+  @@index([datasetId])
+  @@index([name])
+}
+model MsMapLayer {
+  id String @id @default(cuid())
+  name String
+  kind FeatureKind
+  provider String
+  sourceUrl String
+  license String
+  attribution String
+  coverage String
+  version String
+  sourceDate DateTime @db.Timestamptz(3)
+  importedAt DateTime @default(now()) @db.Timestamptz(3)
+  verifiedAt DateTime? @db.Timestamptz(3)
+  features MsMapFeature[]
+  regions MsRegion[]
+  @@unique([provider, name, version])
+}
+model MsMapFeature {
+  id String @id @default(cuid())
+  layerId String
+  layer MsMapLayer @relation(fields: [layerId], references: [id], onDelete: Restrict)
+  sourceId String
+  kind FeatureKind
+  name String?
+  geometry Json
+  attributes Json
+  regionId String?
+  region MsRegion? @relation(fields: [regionId], references: [id], onDelete: Restrict)
+  updates TrOperationalUpdate[]
+  @@unique([layerId, sourceId])
+  @@index([regionId])
+}
+model TrWeatherForecast {
+  id String @id @default(cuid())
+  regionId String
+  region MsRegion @relation(fields: [regionId], references: [id], onDelete: Restrict)
+  provider String @default("BMKG")
+  issuedAt DateTime @db.Timestamptz(3)
+  validAt DateTime @db.Timestamptz(3)
+  fetchedAt DateTime @default(now()) @db.Timestamptz(3)
+  temperature Float?
+  humidity Float?
+  windSpeed Float?
+  windSpeedUnit String @default("km/h")
+  windDirectionRaw String?
+  windFromDegrees Float?
+  weatherDescription String?
+  weatherDescriptionEn String?
+  raw Json
+  @@unique([provider, regionId, issuedAt, validAt])
+  @@index([regionId, validAt])
+}
+model MsTeam {
+  id String @id @default(cuid())
+  name String
+  organization String?
+  active Boolean @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  equipment MsEquipment[]
+  assignments TrAssignment[]
+  updates TrOperationalUpdate[]
+  fieldUpdates TrFieldUpdate[]
+}
+model MsEquipment {
+  id String @id @default(cuid())
+  name String
+  kind String
+  teamId String?
+  team MsTeam? @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  active Boolean @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updates TrOperationalUpdate[]
+  @@index([teamId])
+}
+model TrAssignment {
+  id String @id @default(cuid())
+  caseId String
+  case TrCase @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  teamId String
+  team MsTeam @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  assigningAdminId String
+  assigningAdmin MsUser @relation(fields: [assigningAdminId], references: [id], onDelete: Restrict)
+  status AssignmentStatus @default(ASSIGNED)
+  notes String?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  @@index([caseId, status])
+  @@index([teamId])
+  @@index([assigningAdminId])
+}
+model TrOperationalUpdate {
+  id String @id @default(cuid())
+  recorderId String
+  recorder MsUser @relation(fields: [recorderId], references: [id], onDelete: Restrict)
+  subjectType SubjectType
+  teamId String?
+  team MsTeam? @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  equipmentId String?
+  equipment MsEquipment? @relation(fields: [equipmentId], references: [id], onDelete: Restrict)
+  featureId String?
+  feature MsMapFeature? @relation(fields: [featureId], references: [id], onDelete: Restrict)
+  condition String
+  source String
+  observedAt DateTime @db.Timestamptz(3)
+  notes String?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  @@index([teamId, observedAt])
+  @@index([equipmentId, observedAt])
+  @@index([featureId, observedAt])
+  @@index([recorderId])
+}
+model TrAnalysis {
+  id String @id @default(cuid())
+  caseId String
+  case TrCase @relation("caseAnalyses", fields: [caseId], references: [id], onDelete: Restrict)
+  currentFor TrCase? @relation("latestAnalysis")
+  contextRevision Int
+  status RunStatus @default(RUNNING)
+  input Json
+  output Json?
+  evidenceLevel EvidenceLevel?
+  impactLevel EvidenceLevel?
+  suggestedPriority Priority?
+  model String?
+  schemaVersion String @default("1")
+  promptVersion String?
+  ruleVersion String @default("1")
+  failureCode String?
+  startedAt DateTime @default(now()) @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+  @@index([caseId, contextRevision])
+}
+model TrPublicInformation {
+  id String @id @default(cuid())
+  slug String @unique
+  title String
+  summary String
+  body String
+  type PublicationType
+  status PublicationStatus @default(DRAFT)
+  sources Json
+  caseId String?
+  case TrCase? @relation(fields: [caseId], references: [id], onDelete: Restrict)
+  authorId String
+  author MsUser @relation("author", fields: [authorId], references: [id], onDelete: Restrict)
+  publisherId String?
+  publisher MsUser? @relation("publisher", fields: [publisherId], references: [id], onDelete: Restrict)
+  authorityReference String?
+  publishedAt DateTime? @db.Timestamptz(3)
+  validUntil DateTime? @db.Timestamptz(3)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  withdrawalReason String?
+  supersedesId String?
+  supersedes TrPublicInformation? @relation("replacement", fields: [supersedesId], references: [id], onDelete: Restrict)
+  replacements TrPublicInformation[] @relation("replacement")
+  publicLocationMode PublicLocationMode @default(NONE)
+  publicLatitude Float?
+  publicLongitude Float?
+  publicCaseSnapshot Json?
+  privacyReview String?
+  regions TrPublicInformationRegion[]
+  attachments TrAttachment[]
+  @@index([status, type, publishedAt])
+  @@index([caseId])
+  @@index([authorId])
+  @@index([publisherId])
+  @@index([supersedesId])
+}
+model TrPublicInformationRegion {
+  publicInformationId String
+  publicInformation TrPublicInformation @relation(fields: [publicInformationId], references: [id], onDelete: Restrict)
+  regionId String
+  region MsRegion @relation(fields: [regionId], references: [id], onDelete: Restrict)
+  @@id([publicInformationId, regionId])
+  @@index([regionId])
+}
+model MsSiteProfile {
+  id String @id @default("site")
+  name String?
+  operator String?
+  email String?
+  phone String?
+  address String?
+  hours String?
+  source String?
+  verifiedAt DateTime? @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+}
+model TrIntegrationRun {
+  id String @id @default(cuid())
+  provider String
+  scope Json
+  status RunStatus @default(RUNNING)
+  startedAt DateTime @default(now()) @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+  received Int?
+  imported Int?
+  deduplicated Int?
+  failureCode String?
+  @@index([provider, startedAt])
+}
+model TrAuditLog {
+  id String @id @default(cuid())
+  actorId String?
+  actor MsUser? @relation(fields: [actorId], references: [id], onDelete: Restrict)
+  systemActor String?
+  action String
+  targetType String
+  targetId String
+  reason String?
+  details Json?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  @@index([targetType, targetId, createdAt])
+  @@index([actorId])
+}
