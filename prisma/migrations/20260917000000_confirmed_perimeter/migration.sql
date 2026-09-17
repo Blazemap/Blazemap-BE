@@ -1,0 +1,7 @@
+ALTER TYPE "PublicLocationMode" ADD VALUE 'APPROVED_INCIDENT_PERIMETER';
+
+ALTER TABLE "TrCase"
+  ADD COLUMN "perimeter" JSONB,
+  ADD COLUMN "perimeterObservedAt" TIMESTAMPTZ(3),
+  ADD COLUMN "perimeterSource" TEXT,
+  ADD COLUMN "perimeterRevision" INTEGER NOT NULL DEFAULT 0;

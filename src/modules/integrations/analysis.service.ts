@@ -5,6 +5,7 @@ import { AppError, boundedText, jsonValue, unavailable } from '../../utils/index
 import { audit, lockedActor } from '../admin/access.js';
 import { analysisSchema, validateAnalysisReferences, validateAnalysisSafety } from './parsing.js';
 import { buildAnalysisContext, privacyLimitation } from './snapshot.js';
+import { loadWindContext } from './wind.js';
 
 export async function analyzeCase(actor: Actor, id: string) {
   return runAnalysis(actor, id);
@@ -22,6 +23,7 @@ async function runAnalysis(actor: Actor | null, id: string, expectedRevision?: n
     const c = await tx.trCase.findUniqueOrThrow({ where: { id }, select: {
       id: true, contextRevision: true, verificationStatus: true, handlingStatus: true, latestAnalysisId: true, regionId: true,
       latestAnalysis: { select: { contextRevision: true, status: true } },
+      region: { select: { id: true, name: true, level: true, bmkgAdm4: true, verifiedAt: true } },
       reports: { select: { id: true, observationTypes: true, observedAt: true, locationMode: true, latitude: true, longitude: true, updates: { select: { id: true, kind: true, createdAt: true }, orderBy: { createdAt: 'desc' }, take: 20 } }, take: 100, orderBy: { observedAt: 'desc' } },
       hotspots: { select: { id: true, acquiredAt: true, latitude: true, longitude: true, product: true, confidenceRaw: true, frp: true }, take: 200, orderBy: { acquiredAt: 'desc' } },
       fieldUpdates: { select: { id: true, findings: true, observedAt: true, latitude: true, longitude: true }, take: 100, orderBy: { observedAt: 'desc' } },
@@ -39,12 +41,13 @@ async function runAnalysis(actor: Actor | null, id: string, expectedRevision?: n
     const recent = await tx.trAnalysis.findFirst({ where: { caseId: id, startedAt: { gt: new Date(Date.now() - (actor ? 60000 : 900000)) } } });
     if (recent) throw new AppError('Analysis recently requested; retry later', 429, 'ANALYSIS_RATE_LIMIT');
     const now = new Date();
-    const forecast = c.regionId ? await tx.trWeatherForecast.findFirst({ where: { provider: 'BMKG', regionId: c.regionId, validAt: { lte: now, gt: new Date(now.getTime() - 10800000) }, issuedAt: { lte: now }, fetchedAt: { gt: new Date(now.getTime() - 86400000) } }, orderBy: [{ issuedAt: 'desc' }, { validAt: 'desc' }], select: { id: true, issuedAt: true, validAt: true, fetchedAt: true, temperature: true, humidity: true, windSpeed: true, windFromDegrees: true } }) : null;
+    const wind = await loadWindContext(tx, c.region, now);
+    const forecast = ['READY', 'CALM', 'MISSING_WIND'].includes(wind.windContext.status) ? wind.forecast : null;
     const spatial = c.regionId ? await tx.msMapFeature.findMany({ where: { regionId: c.regionId, layer: { verifiedAt: { not: null } } }, select: { id: true, name: true, kind: true, regionId: true, layerId: true, layer: { select: { sourceDate: true, importedAt: true } } }, take: 100 }) : [];
     const operational = await tx.trOperationalUpdate.findMany({ where: { observedAt: { gt: new Date(now.getTime() - 86400000), lte: now }, OR: [{ team: { assignments: { some: { caseId: id, status: { in: ['ASSIGNED', 'ACCEPTED', 'IN_PROGRESS'] } } } } }, { equipment: { team: { assignments: { some: { caseId: id, status: { in: ['ASSIGNED', 'ACCEPTED', 'IN_PROGRESS'] } } } } } }, ...(c.regionId ? [{ feature: { regionId: c.regionId } }] : [])] }, select: { id: true, subjectType: true, teamId: true, equipmentId: true, featureId: true, condition: true, observedAt: true }, take: 100, orderBy: { observedAt: 'desc' } });
     let context: ReturnType<typeof buildAnalysisContext>;
     try {
-      context = buildAnalysisContext(c, forecast, spatial, operational);
+      context = buildAnalysisContext(c, forecast, spatial, operational, wind.windContext);
       if (!context.observations.length) throw new AppError('Analysis requires observations', 409, 'NO_OBSERVATIONS');
       if (context.observations.length + spatial.length + operational.length + (forecast ? 1 : 0) > 50) throw new AppError('Case context exceeds the AI service limit of 50 sources', 409, 'CONTEXT_TOO_LARGE');
       if (Buffer.byteLength(JSON.stringify(context)) > 128 * 1024) throw new AppError('Case context exceeds the AI service limit of 128 KiB', 409, 'CONTEXT_TOO_LARGE');

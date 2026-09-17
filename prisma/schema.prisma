@@ -74,6 +74,7 @@ enum PublicLocationMode {
   NONE
   REGION_ONLY
   APPROVED_INCIDENT_POINT
+  APPROVED_INCIDENT_PERIMETER
 }
 enum UploadState {
   PENDING
@@ -267,6 +268,10 @@ model TrCase {
   priorityReason String?
   version Int @default(1)
   contextRevision Int @default(1)
+  perimeter Json?
+  perimeterObservedAt DateTime? @db.Timestamptz(3)
+  perimeterSource String?
+  perimeterRevision Int @default(0)
   latestAnalysisId String? @unique
   latestAnalysis TrAnalysis? @relation("latestAnalysis", fields: [latestAnalysisId], references: [id], onDelete: Restrict)
   openedAt DateTime @default(now()) @db.Timestamptz(3)

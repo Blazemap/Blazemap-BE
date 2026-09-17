@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { buildWindContext } from './wind.js';
 import { featureKinds, fieldFindings, latitudeSchema, longitudeSchema, operationalConditions, verificationStatuses } from '../../types/index.js';
 
 export const privacyLimitation = 'Free-text narratives omitted for privacy; consult field evidence locally';
@@ -11,7 +12,7 @@ const caseSchema = z.object({ id, contextRevision: z.number().int().positive(), 
 const weatherSchema = z.object({ id, issuedAt: z.date(), validAt: z.date(), fetchedAt: z.date(), temperature: z.number().finite().nullable(), humidity: z.number().min(0).max(100).nullable(), windSpeed: z.number().finite().nonnegative().nullable(), windFromDegrees: z.number().min(0).lt(360).nullable() });
 const spatialSchema = z.object({ id, name: z.string().max(200).nullable(), kind: z.enum(featureKinds), regionId: id.nullable(), layerId: id, layer: z.object({ sourceDate: z.date(), importedAt: z.date() }) });
 const operationalSchema = z.object({ id, subjectType: z.enum(['TEAM', 'EQUIPMENT', 'FEATURE']), teamId: id.nullable(), equipmentId: id.nullable(), featureId: id.nullable(), condition: z.string(), observedAt: z.date() }).refine(v => (operationalConditions[v.subjectType] as readonly string[]).includes(v.condition)).refine(v => [v.teamId, v.equipmentId, v.featureId].filter(Boolean).length === 1 && !!(v.subjectType === 'TEAM' ? v.teamId : v.subjectType === 'EQUIPMENT' ? v.equipmentId : v.featureId));
-export function buildAnalysisContext(caseValue: unknown, forecastValue: unknown, spatialValues: unknown[], operationalValues: unknown[]) {
+export function buildAnalysisContext(caseValue: unknown, forecastValue: unknown, spatialValues: unknown[], operationalValues: unknown[], windContext: ReturnType<typeof buildWindContext> | null = null) {
   const c = caseSchema.parse(caseValue);
   const forecast = forecastValue == null ? null : weatherSchema.parse(forecastValue);
   const spatial = spatialValues.map(value => spatialSchema.parse(value));
@@ -25,7 +26,7 @@ export function buildAnalysisContext(caseValue: unknown, forecastValue: unknown,
   ];
   const from = forecast?.windSpeed != null && forecast.windSpeed > 0 ? forecast.windFromDegrees : null;
   return {
-    caseId: c.id, contextRevision: c.contextRevision, verificationStatus: c.verificationStatus, observations,
+    caseId: c.id, contextRevision: c.contextRevision, verificationStatus: c.verificationStatus, observations, windContext,
     weather: forecast ? { id: forecast.id, provider: 'BMKG', issuedAt: forecast.issuedAt.toISOString(), validAt: forecast.validAt.toISOString(), fetchedAt: forecast.fetchedAt.toISOString(), temperature: forecast.temperature, humidity: forecast.humidity, windSpeed: forecast.windSpeed, windSpeedUnit: 'km/h', windFromDegrees: from, windToDegrees: from == null ? null : (from + 180) % 360, directionPrecision: 'CARDINAL', measurementType: 'FORECAST' } : null,
     spatialContext: spatial.map(s => ({ id: s.id, name: ['FACILITY', 'SETTLEMENT', 'DESIGNATED_LOCATION'].includes(s.kind) ? s.name?.trim() || null : null, kind: s.kind, regionId: s.regionId, layerId: s.layerId, sourceDate: s.layer.sourceDate.toISOString(), importedAt: s.layer.importedAt.toISOString(), relationBasis: 'ADMINISTRATIVE_REGION_ONLY', distanceMeters: null, downwind: null })),
     operationalContext: operational.map(o => ({ id: o.id, subjectType: o.subjectType, subjectId: o.subjectType === 'TEAM' ? o.teamId : o.subjectType === 'EQUIPMENT' ? o.equipmentId : o.featureId, condition: o.condition, observedAt: o.observedAt.toISOString() })),

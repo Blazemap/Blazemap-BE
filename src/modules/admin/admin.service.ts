@@ -3,8 +3,10 @@ import { z } from 'zod';
 import type { PrismaClient } from '../../generated/prisma/client.js';
 import { db } from '../../config/index.js';
 import { caseSchema, casePatchSchema, fieldSchema, verificationSchema, reviewSchema, paginationSchema, assignmentSchema, assignmentPatchSchema, teamSchema, equipmentSchema, operationalSchema, handlingStatuses, verificationStatuses, priorities, type Actor } from '../../types/index.js';
-import { AppError } from '../../utils/index.js';
+import { AppError, jsonValue } from '../../utils/index.js';
+import { areaHectares, polygonSchema } from '../../utils/geometry.js';
 import { attach } from '../uploads/uploads.service.js';
+import { loadWindContext } from '../integrations/wind.js';
 import { reportDto, reportInclude } from '../reports/reports.service.js';
 import { activeAssignments, audit, bumpContext, lockedActor, verifiedRegion } from './access.js';
 import { assertVersion, transition, verificationProjection } from './rules.js';
@@ -17,8 +19,8 @@ export async function listCases(query: unknown) {
   return { data, meta: { total, page, pageSize } };
 }
 export async function getCase(id: string) {
-  const c = await db().trCase.findUnique({ where: { id }, select: { ...caseSelect,
-    region: { select: { id: true, name: true, timezone: true } },
+  const c = await db().trCase.findUnique({ where: { id }, select: { ...caseSelect, perimeter: true, perimeterObservedAt: true, perimeterSource: true, perimeterRevision: true,
+    region: { select: { id: true, name: true, timezone: true, level: true, bmkgAdm4: true, verifiedAt: true } },
     reports: { include: reportInclude, orderBy: { observedAt: 'desc' }, take: 100 },
     hotspots: { select: { id: true, source: true, product: true, latitude: true, longitude: true, acquiredAt: true, confidenceRaw: true, frp: true, satellite: true, instrument: true, version: true, fetchedAt: true }, take: 300, orderBy: { acquiredAt: 'desc' } },
     fieldUpdates: { select: { id: true, findings: true, description: true, source: true, teamId: true, observedAt: true, createdAt: true, latitude: true, longitude: true, attachments: { select: { id: true, filename: true, contentType: true, size: true } } }, take: 100, orderBy: { observedAt: 'desc' } },
@@ -28,9 +30,11 @@ export async function getCase(id: string) {
   } });
   if (!c) throw new AppError('Case not found', 404, 'NOT_FOUND');
   const timeline = await db().trAuditLog.findMany({ where: { targetType: 'CASE', targetId: id }, select: { id: true, action: true, reason: true, details: true, createdAt: true }, orderBy: { createdAt: 'desc' }, take: 200 });
-  const weather = c.regionId ? await db().trWeatherForecast.findMany({ where: { regionId: c.regionId, validAt: { gte: new Date(Date.now() - 10800000), lte: new Date(Date.now() + 86400000) } }, select: { id: true, provider: true, issuedAt: true, validAt: true, fetchedAt: true, temperature: true, humidity: true, windSpeed: true, windSpeedUnit: true, windDirectionRaw: true, windFromDegrees: true, weatherDescriptionEn: true }, orderBy: [{ issuedAt: 'desc' }, { validAt: 'asc' }], take: 24 }) : [];
+  const { forecast, windContext } = await loadWindContext(db(), c.region);
+  const weather = forecast && windContext.forecast ? [{ ...windContext.forecast, temperature: forecast.temperature, humidity: forecast.humidity, windSpeed: windContext.windSpeedKmh, windSpeedUnit: 'km/h', windFromDegrees: windContext.windFromDegrees, windToDegrees: windContext.windToDegrees, directionPrecision: 'CARDINAL', measurementType: 'FORECAST', stale: !['READY', 'CALM', 'MISSING_WIND'].includes(windContext.status) }] : [];
   const spatialContext = c.regionId ? await db().msMapFeature.findMany({ where: { regionId: c.regionId, layer: { verifiedAt: { not: null } } }, select: { id: true, name: true, kind: true, layer: { select: { provider: true, attribution: true, sourceDate: true, version: true } } }, take: 100 }) : [];
-  return { ...c, reports: c.reports.map(reportDto), timeline, weather: weather.map(w => ({ ...w, windToDegrees: w.windFromDegrees == null ? null : (w.windFromDegrees + 180) % 360, directionPrecision: 'CARDINAL', stale: Date.now() - w.fetchedAt.getTime() > 86400000 })), spatialContext };
+  const perimeter = polygonSchema.safeParse(c.perimeter);
+  return { ...c, areaHectares: perimeter.success ? areaHectares(perimeter.data) : null, reports: c.reports.map(reportDto), timeline, weather, windContext, spatialContext };
 }
 export async function createCase(actor: Actor, body: unknown) {
   const { reason, ...data } = caseSchema.parse(body);
@@ -42,13 +46,23 @@ export async function createCase(actor: Actor, body: unknown) {
     return c;
   });
 }
-export async function updateCase(actor: Actor, id: string, body: unknown) {
+export async function updateCase(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
   const input = casePatchSchema.parse(body);
-  return db().$transaction(async tx => {
-    await lockedActor(tx, actor, true);
+  return client.$transaction(async tx => {
+    const user = await lockedActor(tx, actor, true, 'perimeter' in input ? 'canConfirmIncidents' : undefined);
+    if ('perimeter' in input) {
+      const verified = await tx.msUser.findUnique({ where: { id: user.id }, select: { emailVerified: true } });
+      if (!verified?.emailVerified) throw new AppError('Verified administrator required', 403, 'FORBIDDEN');
+    }
     await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${id} FOR UPDATE`;
     const c = await tx.trCase.findUniqueOrThrow({ where: { id } });
     assertVersion(c.version, input.version);
+    if ('perimeter' in input) {
+      if (c.verificationStatus !== 'CONFIRMED_FIRE') throw new AppError('Perimeter requires a confirmed fire', 409, 'INVALID_TRANSITION');
+      const data = await tx.trCase.update({ where: { id, version: input.version }, data: { perimeter: jsonValue(input.perimeter), perimeterObservedAt: new Date(input.perimeterObservedAt), perimeterSource: input.perimeterSource, perimeterRevision: { increment: 1 }, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null }, select: { ...caseSelect, perimeter: true, perimeterObservedAt: true, perimeterSource: true, perimeterRevision: true } });
+      await audit(tx, actor.id, 'CASE_PERIMETER_UPDATED', 'CASE', id, input.reason, { authorityReference: input.authorityReference, before: { perimeter: c.perimeter, observedAt: c.perimeterObservedAt, source: c.perimeterSource, revision: c.perimeterRevision }, after: { perimeter: data.perimeter, observedAt: data.perimeterObservedAt, source: data.perimeterSource, revision: data.perimeterRevision }, areaHectares: areaHectares(input.perimeter) });
+      return { ...data, areaHectares: areaHectares(input.perimeter) };
+    }
     const handling = input.handlingStatus ?? c.handlingStatus;
     const count = await tx.trAssignment.count({ where: { caseId: id, status: { in: [...activeAssignments] } } });
     transition(c.verificationStatus, handling, count);
@@ -69,9 +83,9 @@ export async function addFieldUpdate(actor: Actor, id: string, body: unknown, cl
     return item;
   });
 }
-export async function verifyCase(actor: Actor, id: string, body: unknown) {
+export async function verifyCase(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
   const input = verificationSchema.parse(body);
-  return db().$transaction(async tx => {
+  return client.$transaction(async tx => {
     await lockedActor(tx, actor, true, 'canConfirmIncidents');
     await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${id} FOR UPDATE`;
     const c = await tx.trCase.findUniqueOrThrow({ where: { id } });

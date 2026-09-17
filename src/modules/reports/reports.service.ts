@@ -6,6 +6,8 @@ import { reportSchema, paginationSchema, updateSchema, reviewStatuses, type Acto
 import { AppError, fingerprint } from '../../utils/index.js';
 import { audit, lockedActor, verifiedRegion, bumpContext } from '../admin/access.js';
 import { attach } from '../uploads/uploads.service.js';
+import { triageReports } from './triage.js';
+export { triageReports } from './triage.js';
 
 export const reportInclude = {
   case: { select: { id: true, number: true, verificationStatus: true, handlingStatus: true } },
@@ -15,18 +17,20 @@ export const reportInclude = {
 export function reportDto(r: TrReport & { case?: unknown; region?: unknown; attachments?: unknown; updates?: unknown }) {
   return { id: r.id, number: r.number, observationTypes: r.observationTypes, observedAt: r.observedAt, createdAt: r.createdAt, locationMode: r.locationMode, latitude: r.latitude, longitude: r.longitude, accuracyMeters: r.accuracyMeters, regionId: r.regionId, region: r.region, locationDescription: r.locationDescription, description: r.description, reviewStatus: r.reviewStatus, case: r.case, attachments: r.attachments, ...(r.updates ? { updates: r.updates } : {}) };
 }
-export async function listReports(actor: Actor, query: unknown, admin = false) {
+export async function listReports(actor: Actor, query: unknown, admin = false, client: PrismaClient = db()) {
   const { page, pageSize, search, reviewStatus, regionId } = paginationSchema.extend({ reviewStatus: z.enum(reviewStatuses).optional() }).parse(query);
   if (admin && actor.role !== 'ADMIN') throw new AppError('Administrator access required', 403, 'FORBIDDEN');
   const where = { ...(admin ? {} : { reporterId: actor.id }), reviewStatus, regionId, ...(search ? { OR: [{ number: { contains: search } }, { description: { contains: search, mode: 'insensitive' as const } }] } : {}) };
-  const [rows, total] = await db().$transaction([db().trReport.findMany({ where, include: reportInclude, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], skip: (page - 1) * pageSize, take: pageSize }), db().trReport.count({ where })]);
-  return { data: rows.map(reportDto), meta: { total, page, pageSize } };
+  const [rows, total] = await client.$transaction([client.trReport.findMany({ where, include: reportInclude, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], skip: (page - 1) * pageSize, take: pageSize }), client.trReport.count({ where })]);
+  const triage = admin ? await triageReports(rows, client) : null;
+  return { data: rows.map(row => ({ ...reportDto(row), ...(triage ? { triage: triage.get(row.id)! } : {}) })), meta: { total, page, pageSize } };
 }
-export async function getReport(actor: Actor, id: string, admin = false) {
+export async function getReport(actor: Actor, id: string, admin = false, client: PrismaClient = db()) {
   if (admin && actor.role !== 'ADMIN') throw new AppError('Administrator access required', 403, 'FORBIDDEN');
-  const report = await db().trReport.findFirst({ where: { id, ...(admin ? {} : { reporterId: actor.id }) }, include: { ...reportInclude, updates: { where: admin ? {} : { publicToReporter: true }, orderBy: { createdAt: 'asc' }, select: { id: true, message: true, kind: true, authorRole: true, createdAt: true } } } });
+  const report = await client.trReport.findFirst({ where: { id, ...(admin ? {} : { reporterId: actor.id }) }, include: { ...reportInclude, updates: { where: admin ? {} : { publicToReporter: true }, orderBy: { createdAt: 'asc' }, select: { id: true, message: true, kind: true, authorRole: true, createdAt: true } } } });
   if (!report) throw new AppError('Report not found', 404, 'NOT_FOUND');
-  return reportDto(report);
+  const triage = admin ? await triageReports([report], client) : null;
+  return { ...reportDto(report), ...(triage ? { triage: triage.get(report.id)! } : {}) };
 }
 export async function createReport(actor: Actor, body: unknown) {
   const data = reportSchema.parse(body);

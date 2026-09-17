@@ -18,7 +18,9 @@
     "admin:provision": "tsx src/provision.ts",
     "uploads:cleanup": "tsx src/cleanup.ts",
     "sources:sync": "tsx src/sync.ts",
-    "sources:watch": "tsx src/watch.ts"
+    "sources:watch": "tsx src/watch.ts",
+    "seed:areas": "tsx src/seed-areas.ts",
+    "seed:test-accounts": "tsx src/seed-test-accounts.ts"
   },
   "overrides": {
     "deepmerge-ts": "8.0.2",

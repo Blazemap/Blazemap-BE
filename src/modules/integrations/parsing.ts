@@ -5,7 +5,7 @@ import { priorities } from '../../types/index.js';
 
 export function windDirection(raw: string | null | undefined, speed: number | null | undefined) {
   const cardinal: Record<string, number> = { N: 0, NNE: 22.5, NE: 45, ENE: 67.5, E: 90, ESE: 112.5, SE: 135, SSE: 157.5, S: 180, SSW: 202.5, SW: 225, WSW: 247.5, W: 270, WNW: 292.5, NW: 315, NNW: 337.5 };
-  const from = raw && speed != null && speed > 0 ? cardinal[raw.trim().toUpperCase()] ?? null : null;
+  const from = raw && speed != null && Number.isFinite(speed) && speed > 0 ? cardinal[raw.trim().toUpperCase()] ?? null : null;
   return { windFromDegrees: from, windToDegrees: from == null ? null : (from + 180) % 360 };
 }
 const rowSchema = z.object({
@@ -32,7 +32,7 @@ export function parseBmkg(value: unknown, adm4: string) {
   const location = parsed.data.find(d => d.lokasi.adm4 === adm4);
   if (!location) throw unavailable('BMKG region mapping');
   return location.cuaca.flat().map(r => {
-    const utc = (value: string) => z.iso.datetime({ offset: true }).parse(value.replace(' ', 'T').replace(/(?:Z|\+00:00)?$/, 'Z'));
+    const utc = (value: string) => { const normalized = value.trim().replace(' ', 'T'); return z.iso.datetime({ offset: true }).parse(/(?:Z|[+-]\d{2}:\d{2})$/.test(normalized) ? normalized : `${normalized}Z`); };
     return { issuedAt: new Date(utc(r.analysis_date)), validAt: new Date(utc(r.utc_datetime)), temperature: r.t ?? null, humidity: r.hu ?? null, windSpeed: r.ws ?? null, windDirectionRaw: r.wd ?? null, windFromDegrees: windDirection(r.wd, r.ws).windFromDegrees, weatherDescription: r.weather_desc ?? null, weatherDescriptionEn: r.weather_desc_en ?? null, raw: r };
   });
 }
@@ -51,7 +51,7 @@ export function validateAnalysisSafety(output: z.infer<typeof analysisSchema>, c
   if (output.impactLevel !== 'INSUFFICIENT_DATA' && !supportedSpatial.some(s => citations.has(s.id))) throw unavailable('AI impact grounding');
   if (output.evidenceLevel === 'INSUFFICIENT_DATA' && output.impactLevel === 'INSUFFICIENT_DATA' && output.suggestedPriority !== 'UNASSESSED') throw unavailable('AI priority grounding');
   for (const area of output.monitoringAreas) if (!supportedSpatial.some(s => s.name === area.name && area.sourceIds.includes(s.id))) throw unavailable('AI spatial grounding');
-  const denied = /\b(?:evacuat\w*|dispatch\w*|deploy\w*|warn(?:ing|ings)?|perimeters?|firebreaks?|suppress(?:ion)?|publish\w*)\b|\b(?:fire|incident)\s+(?:(?:is|was|has been)\s+)?(?:confirmed|verified)\b|\bconfirmed\s+(?:fire|incident)\b|\bno\s+fire\b|\b(?:all\s+clear|no\s+risk|safe\s+route)\b|\bsmoke\b[^.!?\n]{0,160}\b(?:arriv\w*|reach\w*|eta|\d+\s*(?:minutes?|hours?))\b|\d+(?:\.\d+)?\s*%|<[^>]+>/i;
+  const denied = /\b(?:evacuat\w*|dispatch\w*|deploy\w*|warn(?:ing|ings)?|perimeters?|firebreaks?|suppress(?:ion)?|publish\w*)\b|\b(?:fire|incident)\s+(?:(?:is|was|has been)\s+)?(?:confirmed|verified)\b|\bconfirmed\s+(?:fire|incident)\b|\bno\s+fire\b|\b(?:all\s+clear|no\s+risk|safe\s+route)\b|\bsmoke\b[^.!?\n]{0,160}\b(?:arriv\w*|reach\w*|eta|\d+\s*(?:minutes?|hours?))\b|\b(?:fire|wildfire|flames?)\b[^.!?\n]{0,100}\b(?:spread|travel|arriv|reach|advance)\w*\b|\b(?:spread|propagation)\s+(?:speed|rate)\b|\d+(?:\.\d+)?\s*%|<[^>]+>/i;
   const texts = [...output.reasons.map(r => r.text), ...output.monitoringAreas.flatMap(a => [a.name, a.reason]), ...output.missingInformation, ...output.suggestedChecks, ...output.limitations];
   if (texts.some(text => denied.test(text.normalize('NFKC').replace(/\p{Cf}/gu, '')))) throw unavailable('AI protected-action validation');
 }

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { polygonSchema } from '../utils/geometry.js';
 
 export const idSchema = z.string().trim().min(1).max(128);
 export const reasonSchema = z.string().trim().min(5).max(2000);
@@ -23,11 +24,12 @@ export const reportSchema = z.strictObject({
   locationMode: z.enum(['INCIDENT_ESTIMATE', 'OBSERVER_POSITION']),
   latitude: latitudeSchema.nullable(), longitude: longitudeSchema.nullable(),
   accuracyMeters: z.number().nonnegative().max(100000).nullish(),
-  regionId: idSchema.nullish(), locationDescription: z.string().trim().min(5).max(1000),
+  regionId: idSchema.nullish(), locationDescription: z.string().trim().max(1000).default(''),
   description: z.string().trim().min(5).max(2000),
   attachmentIds: z.array(idSchema).max(5).refine(v => new Set(v).size === v.length).default([]),
   idempotencyKey: z.string().min(16).max(128),
-}).refine(pairedCoordinates, 'Latitude and longitude must be provided together').refine(v => v.latitude !== null || !!v.regionId, 'Coordinates or a verified region are required');
+}).refine(pairedCoordinates, 'Latitude and longitude must be provided together').refine(v => v.latitude !== null || !!v.regionId, 'Coordinates or a verified region are required')
+  .refine(v => v.latitude !== null || v.locationDescription.length >= 5, { message: 'Without coordinates, describe the location using at least 5 characters', path: ['locationDescription'] });
 export const uploadSchema = z.strictObject({
   filename: z.string().min(1).max(180).regex(/^[^/\\]+\.(jpe?g|png|webp)$/i).refine(v => [...v].every(c => c.charCodeAt(0) >= 32 && c.charCodeAt(0) !== 127)),
   contentType: z.enum(['image/jpeg', 'image/png', 'image/webp']),
@@ -36,7 +38,8 @@ export const uploadSchema = z.strictObject({
 export const caseSchema = z.strictObject({ title: z.string().trim().min(3).max(200), ...coords, regionId: idSchema.nullish(), reason: reasonSchema }).refine(pairedCoordinates);
 export const fieldSchema = z.strictObject({ findings: z.enum(fieldFindings), description: reasonSchema, source: z.string().trim().min(3).max(300), observedAt: timeSchema, ...coords, teamId: idSchema.nullish(), attachmentIds: z.array(idSchema).max(5).default([]) }).refine(pairedCoordinates);
 export const verificationSchema = z.strictObject({ outcome: z.enum(['CONFIRMED_FIRE', 'NOT_FIRE', 'INCONCLUSIVE']), reason: reasonSchema, authorityReference: z.string().trim().min(3).max(500), fieldUpdateId: idSchema, version: z.number().int().positive() });
-export const casePatchSchema = z.strictObject({ priority: z.enum(priorities).optional(), handlingStatus: z.enum(handlingStatuses).optional(), reason: reasonSchema, version: z.number().int().positive() }).refine(v => !!v.priority || !!v.handlingStatus, 'A change is required');
+export const perimeterPatchSchema = z.strictObject({ version: z.number().int().positive(), perimeter: polygonSchema, perimeterObservedAt: timeSchema, perimeterSource: z.string().trim().min(3).max(300), reason: reasonSchema, authorityReference: z.string().trim().min(3).max(500) });
+export const casePatchSchema = z.union([perimeterPatchSchema, z.strictObject({ priority: z.enum(priorities).optional(), handlingStatus: z.enum(handlingStatuses).optional(), reason: reasonSchema, version: z.number().int().positive() }).refine(v => !!v.priority || !!v.handlingStatus, 'A change is required')]);
 export const reviewSchema = z.strictObject({ reviewStatus: z.enum(reviewStatuses).optional(), caseId: idSchema.nullable().optional(), reason: reasonSchema }).refine(v => v.reviewStatus !== undefined || v.caseId !== undefined);
 export const updateSchema = z.strictObject({ message: reasonSchema, kind: z.enum(['CLARIFICATION', 'REQUEST', 'CORRECTION']).optional() });
 export const teamSchema = z.strictObject({ name: z.string().trim().min(2).max(200), organization: z.string().trim().min(2).max(200).nullish() });
@@ -50,9 +53,10 @@ export const publicationSchema = z.strictObject({
   title: z.string().trim().min(3).max(200), summary: z.string().trim().min(5).max(600), body: z.string().trim().min(5).max(40000).refine(v => !/<\/?[a-z][^>]*>/i.test(v), 'Publication body must be plain text or Markdown without HTML'),
   type: z.enum(publicationTypes), sources: z.array(z.strictObject({ title: z.string().trim().min(2).max(200), url: safeUrl })).max(30),
   regionIds: z.array(idSchema).max(30).default([]), caseId: idSchema.nullish(), validUntil: z.iso.datetime({ offset: true }).nullish(),
-  publicLocationMode: z.enum(['NONE', 'REGION_ONLY', 'APPROVED_INCIDENT_POINT']).default('NONE'),
+  publicLocationMode: z.enum(['NONE', 'REGION_ONLY', 'APPROVED_INCIDENT_POINT', 'APPROVED_INCIDENT_PERIMETER']).default('NONE'),
   publicLatitude: latitudeSchema.nullish(), publicLongitude: longitudeSchema.nullish(), privacyReview: reasonSchema.nullish(),
 }).refine(v => v.publicLocationMode !== 'APPROVED_INCIDENT_POINT' || (v.publicLatitude != null && v.publicLongitude != null && !!v.privacyReview && !!v.caseId), 'An approved point requires coordinates, case and privacy review')
+  .refine(v => v.publicLocationMode !== 'APPROVED_INCIDENT_PERIMETER' || (!!v.caseId && !!v.privacyReview), 'An approved perimeter requires a case and privacy review')
   .refine(v => v.publicLocationMode !== 'REGION_ONLY' || v.regionIds.length > 0, 'Region-only projection requires a region');
 export const publishSchema = z.strictObject({ authorityReference: z.string().trim().min(3).max(500), expectedUpdatedAt: z.iso.datetime({ offset: true }) });
 export const withdrawalSchema = z.strictObject({ reason: reasonSchema });

@@ -11,6 +11,7 @@ const raw = z.object({
   GOOGLE_CLIENT_ID: oauthCredential(z.string().max(256).regex(/^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/)),
   GOOGLE_CLIENT_SECRET: oauthCredential(z.string().min(1).max(512).regex(/^[A-Za-z0-9_-]+$/)),
   AI_SERVICE_URL: optional, AI_SERVICE_TOKEN: optional, AI_AUTO_REANALYZE: optional, FIRMS_MAP_KEY: optional, FIRMS_PRODUCTS: optional, FIRMS_AREA: optional, FIRMS_POLL_INTERVAL_MS: optional, BMKG_POLL_INTERVAL_MS: optional,
+  TRIAGE_HOTSPOT_RADIUS_METERS: optional, TRIAGE_HOTSPOT_WINDOW_HOURS: optional, TRIAGE_SETTLEMENT_RADIUS_METERS: optional,
   S3_ENDPOINT: optional, S3_REGION: optional, S3_BUCKET: optional, S3_ACCESS_KEY_ID: optional, S3_SECRET_ACCESS_KEY: optional, S3_FORCE_PATH_STYLE: optional,
   SMTP_HOST: optional, SMTP_PORT: optional, SMTP_SECURE: optional, SMTP_USER: optional, SMTP_PASSWORD: optional, SMTP_FROM: optional,
 }).safeParse(process.env);

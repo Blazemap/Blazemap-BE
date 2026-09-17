@@ -5,6 +5,8 @@ import { AppError } from '../../utils/index.js';
 import type { PrismaClient } from '../../generated/prisma/client.js';
 import { firmsConfigured } from '../integrations/integrations.service.js';
 import { publicPoint } from '../admin/rules.js';
+import { publicPerimeter } from '../../utils/geometry.js';
+import { geometrySchema } from '../admin/datasets.service.js';
 
 export function firmsSourceStatus(configured: boolean, latest: string | null, lastSuccess: Date | null, now = Date.now()): { status: 'AVAILABLE' | 'STALE' | 'NOT_CONFIGURED' | 'NOT_SYNCED' | 'UNAVAILABLE'; message?: string; lastSuccessAt?: string } {
   const lastSuccessAt = lastSuccess ? { lastSuccessAt: lastSuccess.toISOString() } : {};
@@ -59,7 +61,14 @@ export async function publicMap(query: unknown, client: PrismaClient = db(), con
   const cases = publications.flatMap(p => {
     const value = snapshotSchema.safeParse(p.publicCaseSnapshot);
     if (!value.success) return [];
-    return [{ ...value.data, title: p.title, publicationId: p.id, slug: p.slug, publishedAt: p.publishedAt, publicLocationMode: p.publicLocationMode, ...publicPoint(p), regions: p.regions.map(r => r.region) }];
+    return [{ ...value.data, title: p.title, publicationId: p.id, slug: p.slug, publishedAt: p.publishedAt, publicLocationMode: p.publicLocationMode, ...publicPoint(p), ...publicPerimeter(p), regions: p.regions.map(r => r.region) }];
   });
-  return { hotspots: hotspots.slice(0, 2000).map(h => ({ ...h, frpUnit: 'MW', indicationType: 'THERMAL_ANOMALY', stale: sourceStatus.status !== 'AVAILABLE' })), cases: cases.filter((c, i) => cases.findIndex(other => other.id === c.id) === i), updatedAt: last?.completedAt?.toISOString() ?? null, sourceStatus };
+  const demoFeatures = await client.msMapFeature.findMany({ where: { layer: { provider: 'DEMO', name: '[DEMO] Simulated confirmed case areas', version: '1' } }, take: 10, select: { id: true, name: true, geometry: true, attributes: true } });
+  const demoAreas = demoFeatures.flatMap(feature => {
+    const geometry = geometrySchema.safeParse(feature.geometry);
+    const attributes = z.object({ demo: z.literal(true), source: z.literal('SIMULATED'), areaHectares: z.number().positive().finite(), generatedAt: z.iso.datetime(), scenarioStatus: z.literal('SIMULATED_CONFIRMED_FIRE') }).safeParse(feature.attributes);
+    if (!geometry.success || geometry.data.type !== 'Polygon' || !attributes.success || !feature.name?.startsWith('[DEMO]')) return [];
+    return [{ id: feature.id, name: feature.name, geometry: geometry.data, areaHectares: attributes.data.areaHectares, generatedAt: attributes.data.generatedAt, demo: true as const }];
+  });
+  return { demoAreas, hotspots: hotspots.slice(0, 2000).map(h => ({ ...h, frpUnit: 'MW', indicationType: 'THERMAL_ANOMALY', stale: sourceStatus.status !== 'AVAILABLE' })), cases: cases.filter((c, i) => cases.findIndex(other => other.id === c.id) === i), updatedAt: last?.completedAt?.toISOString() ?? null, sourceStatus };
 }

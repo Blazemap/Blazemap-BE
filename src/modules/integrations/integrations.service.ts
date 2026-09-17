@@ -27,7 +27,7 @@ async function claimRun(provider: string, scope: unknown, actor: Actor | undefin
     const delay = provider === 'FIRMS' ? pollIntervals().FIRMS : 60000;
     if (recent?.status === 'RUNNING' || (recent && Date.now() - recent.startedAt.getTime() < delay)) throw new AppError('Integration recently requested; retry later', 429, 'SYNC_RATE_LIMIT');
     return tx.trIntegrationRun.create({ data: { provider, scope: jsonValue(scope) } });
-  });
+  }, { maxWait: 10000, timeout: 30000 });
 }
 export async function syncSource(source: string, body: unknown, actor?: Actor, client: PrismaClient = db()) {
   const input = syncSchema.parse(body);
@@ -74,22 +74,30 @@ export async function syncSource(source: string, body: unknown, actor?: Actor, c
         const response = await fetch(url, { signal: AbortSignal.timeout(30000), redirect: 'error' });
         const rows = parseFirms(await boundedText(response), product);
         received += rows.length;
-        for (let offset = 0; offset < rows.length; offset += 200) {
-          const batch = rows.slice(offset, offset + 200);
+        for (let offset = 0; offset < rows.length; offset += 500) {
+          const batch = [...new Map(rows.slice(offset, offset + 500).map(row => [row.observationKey, row])).values()];
           if (Date.now() - run.startedAt.getTime() > 480000) throw unavailable('FIRMS run time limit');
           imported += await client.$transaction(async tx => {
             await lockRun(tx, run.id);
-            let inserted = 0;
+            const existingRows = await tx.trHotspot.findMany({ where: { observationKey: { in: batch.map(row => row.observationKey) } }, select: { observationKey: true, caseId: true, product: true, raw: true, confidenceRaw: true, frp: true, version: true } });
+            const existingByKey = new Map(existingRows.map(row => [row.observationKey, row]));
+            const fetchedAt = new Date();
+            const newRows = batch.filter(row => !existingByKey.has(row.observationKey));
+            const inserted = newRows.length ? (await tx.trHotspot.createMany({ data: newRows.map(row => ({ ...row, raw: jsonValue(row.raw), fetchedAt })) })).count : 0;
+            const unchanged: string[] = [];
             const cases = new Set<string>();
             for (const row of batch) {
-              const existing = await tx.trHotspot.findUnique({ where: { observationKey: row.observationKey }, select: { id: true, caseId: true, confidenceRaw: true, frp: true, version: true } });
-              await tx.trHotspot.upsert({ where: { observationKey: row.observationKey }, create: { ...row, raw: jsonValue(row.raw) }, update: { ...row, raw: jsonValue(row.raw), fetchedAt: new Date() } });
-              if (!existing) inserted++;
-              else if (existing.caseId && (existing.confidenceRaw !== row.confidenceRaw || existing.frp !== row.frp || existing.version !== row.version)) cases.add(existing.caseId);
+              const existing = existingByKey.get(row.observationKey);
+              if (!existing) continue;
+              const changed = existing.product !== row.product || existing.confidenceRaw !== row.confidenceRaw || existing.frp !== row.frp || existing.version !== row.version || fingerprint(existing.raw) !== fingerprint(row.raw);
+              if (!changed) { unchanged.push(row.observationKey); continue; }
+              await tx.trHotspot.update({ where: { observationKey: row.observationKey }, data: { ...row, raw: jsonValue(row.raw), fetchedAt } });
+              if (existing.caseId) cases.add(existing.caseId);
             }
+            if (unchanged.length) await tx.trHotspot.updateMany({ where: { observationKey: { in: unchanged } }, data: { fetchedAt } });
             for (const caseId of [...cases].sort()) await sourceContextChanged(tx, caseId, run.id, provider);
             return inserted;
-          }, { timeout: 30000 });
+          }, { maxWait: 10000, timeout: 30000 });
         }
       }
     } else {
@@ -125,7 +133,9 @@ export async function syncSource(source: string, body: unknown, actor?: Actor, c
       await client.trIntegrationRun.update({ where: { id: run.id, status: 'RUNNING' }, data: { status: 'OBSOLETE', completedAt: new Date(), received: 0, imported: 0, deduplicated: 0 } });
       return { id: run.id, provider, status: 'CACHED', received: 0, imported: 0, deduplicated: 0 };
     }
-    await client.trIntegrationRun.update({ where: { id: run.id, status: 'RUNNING' }, data: { status: 'SUCCEEDED', completedAt: new Date(), received, imported, deduplicated: received - imported } });
+    const completedAt = new Date();
+    const coverage = provider === 'FIRMS' ? { scope: jsonValue({ products: requestedProducts, area, days: 2, observedFrom: new Date(Date.UTC(completedAt.getUTCFullYear(), completedAt.getUTCMonth(), completedAt.getUTCDate() - 1)).toISOString(), observedTo: run.startedAt.toISOString() }) } : {};
+    await client.trIntegrationRun.update({ where: { id: run.id, status: 'RUNNING' }, data: { status: 'SUCCEEDED', completedAt, received, imported, deduplicated: received - imported, ...coverage } });
     return { id: run.id, provider, status: 'SUCCEEDED', received, imported, deduplicated: received - imported };
   } catch {
     await client.trIntegrationRun.updateMany({ where: { id: run.id, status: 'RUNNING' }, data: { status: 'FAILED', completedAt: new Date(), received, imported, failureCode: 'SOURCE_UNAVAILABLE' } });

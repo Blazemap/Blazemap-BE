@@ -4,6 +4,7 @@ import type { Prisma, PrismaClient } from '../../generated/prisma/client.js';
 import { db } from '../../config/index.js';
 import { publicationSchema, publishSchema, withdrawalSchema, settingsSchema, informationQuerySchema, type Actor, type Transaction } from '../../types/index.js';
 import { AppError, jsonValue } from '../../utils/index.js';
+import { areaHectares, publicPerimeterSchema } from '../../utils/geometry.js';
 import { audit, lockedActor, verifiedRegion } from './access.js';
 import { assertPublicationRevision, nextPublicationTimestamp } from './rules.js';
 
@@ -92,11 +93,18 @@ export async function publishInformation(actor: Actor, id: string, body: unknown
     if (item.type === 'WARNING' && !item.validUntil) throw new AppError('Warnings require a validity end time', 400, 'VALIDITY_REQUIRED');
     await validateRegions(tx, item.regions.map(v => v.regionId));
     let snapshot: Prisma.InputJsonValue | undefined;
+    if (item.publicLocationMode === 'APPROVED_INCIDENT_PERIMETER' && (!item.caseId || !item.privacyReview?.trim())) throw new AppError('Public perimeter needs a case and explicit privacy review', 400, 'PRIVACY_REVIEW_REQUIRED');
     if (item.caseId) {
       await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${item.caseId} FOR UPDATE`;
       const c = await tx.trCase.findUniqueOrThrow({ where: { id: item.caseId } });
       if (item.publicLocationMode === 'APPROVED_INCIDENT_POINT' && (!item.privacyReview || item.publicLatitude == null || item.publicLongitude == null)) throw new AppError('Public point needs explicit privacy review', 400, 'PRIVACY_REVIEW_REQUIRED');
-      snapshot = jsonValue({ id: c.id, number: c.number, title: item.title, verificationStatus: c.verificationStatus, handlingStatus: c.handlingStatus, approvedAt: new Date().toISOString() });
+      let publicPerimeter;
+      if (item.publicLocationMode === 'APPROVED_INCIDENT_PERIMETER') {
+        const parsed = publicPerimeterSchema.omit({ areaHectares: true }).safeParse({ geometry: c.perimeter, observedAt: c.perimeterObservedAt?.toISOString(), source: c.perimeterSource, revision: c.perimeterRevision });
+        if (c.verificationStatus !== 'CONFIRMED_FIRE' || !parsed.success) throw new AppError('A confirmed fire with a valid audited perimeter is required', 409, 'INVALID_PERIMETER');
+        publicPerimeter = { ...parsed.data, areaHectares: areaHectares(parsed.data.geometry) };
+      }
+      snapshot = jsonValue({ id: c.id, number: c.number, title: item.title, verificationStatus: c.verificationStatus, handlingStatus: c.handlingStatus, approvedAt: new Date().toISOString(), ...(publicPerimeter ? { publicPerimeter } : {}) });
     }
     if (item.supersedesId) {
       const old = await tx.trPublicInformation.updateMany({ where: { id: item.supersedesId, status: 'PUBLISHED' }, data: { status: 'SUPERSEDED', updatedAt: new Date() } });
