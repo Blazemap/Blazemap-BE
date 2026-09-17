@@ -5,7 +5,12 @@ import { auth, db, databaseAvailable, origins } from '../config/index.js';
 import { AppError, unavailable } from '../utils/index.js';
 import type { Actor } from '../types/index.js';
 
-export const databaseGuard: RequestHandler = async (_req, _res, next) => { if (!(await databaseAvailable())) throw unavailable('Database'); next(); };
+export const databaseGuard: RequestHandler = async (_req, res, next) => {
+  res.locals.requestStage = 'database';
+  if (!(await databaseAvailable())) throw unavailable('Database');
+  res.locals.requestStage = 'routing';
+  next();
+};
 export const sessionGuard: RequestHandler = async (req, res, next) => {
   const session = await auth().api.getSession({ headers: fromNodeHeaders(req.headers), query: { disableCookieCache: true } });
   if (!session) throw new AppError('Login required', 401, 'UNAUTHORIZED');
@@ -19,7 +24,8 @@ export const originGuard: RequestHandler = (req, _res, next) => {
   if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     const origin = req.headers.origin;
     if (!origin || !origins.includes(origin)) throw new AppError('Request origin not allowed', 403, 'INVALID_ORIGIN');
-    if (!req.is('application/json')) throw new AppError('JSON request required', 415, 'INVALID_CONTENT_TYPE');
+    const avatarUpload = req.method === 'POST' && /^\/api\/profile\/[a-zA-Z0-9_-]+\/avatar$/.test(req.path) && req.is('image/jpeg');
+    if (!avatarUpload && !req.is('application/json')) throw new AppError('Unsupported request content type', 415, 'INVALID_CONTENT_TYPE');
   }
   next();
 };

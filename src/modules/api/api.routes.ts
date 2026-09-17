@@ -1,4 +1,5 @@
-import { Router } from 'express';
+import { Router, raw } from 'express';
+import { saveAvatar, readAvatar } from '../profile/index.js';
 import { rateLimit } from 'express-rate-limit';
 import { sessionGuard, adminGuard } from '../../middleware/index.js';
 import { enums, type Actor } from '../../types/index.js';
@@ -20,6 +21,14 @@ router.get('/public/regions', single(req => publicApi.regions(req.query)));
 router.get('/public/enums', single(() => enums));
 router.get('/public/media/:id', single(req => uploads.publicDownload(routeId(req))));
 router.use(sessionGuard);
+router.post('/profile/:id/avatar', expensive, raw({ type: 'image/jpeg', limit: '1mb' }), single((req, res) => saveAvatar(res.locals.actor as Actor, routeId(req), req.body)));
+router.get('/profile/:id/avatar', async (req, res) => {
+  const bytes = await readAvatar(res.locals.actor as Actor, routeId(req));
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Content-Type', 'image/jpeg');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.send(bytes);
+});
 router.get('/map', single((req, res) => { res.setHeader('Cache-Control', 'private, no-store'); return publicApi.publicMap(req.query); }));
 router.get('/reports', list((req, res) => reports.listReports(res.locals.actor as Actor, req.query)));
 router.post('/reports', writes, single((req, res) => reports.createReport(res.locals.actor as Actor, req.body), 201));
