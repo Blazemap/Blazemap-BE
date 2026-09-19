@@ -7,6 +7,8 @@ import { AppError, fingerprint, jsonValue } from '../../utils/index.js';
 import { areaHectares, polygonSchema } from '../../utils/geometry.js';
 import { attach } from '../uploads/uploads.service.js';
 import { loadWindContext } from '../integrations/wind.js';
+import { buildExposure } from '../integrations/exposure.js';
+import { citationSources } from '../integrations/citations.js';
 import { progressSelect, reportDto, reportInclude } from '../reports/reports.service.js';
 import { recordCaseProgress } from '../reports/progress.js';
 import { createReportNotification } from '../notifications/index.js';
@@ -25,13 +27,13 @@ export async function listCases(query: unknown) {
   return { data, meta: { total, page, pageSize } };
 }
 export async function getCase(id: string, actor?: Actor) {
-  const c = await db().trCase.findUnique({ where: { id }, select: { ...caseSelect, perimeter: true, perimeterObservedAt: true, perimeterSource: true, perimeterRevision: true,
+  const c = await db().trCase.findUnique({ where: { id }, select: { ...caseSelect, bmkgAdm4Reference: true, weatherReference: true, perimeter: true, perimeterObservedAt: true, perimeterSource: true, perimeterRevision: true,
     region: { select: { id: true, name: true, timezone: true, level: true, bmkgAdm4: true, verifiedAt: true } },
     reports: { include: reportInclude, orderBy: { observedAt: 'desc' }, take: 100 },
     hotspots: { select: { id: true, source: true, product: true, latitude: true, longitude: true, acquiredAt: true, confidenceRaw: true, frp: true, satellite: true, instrument: true, version: true, fetchedAt: true }, take: 300, orderBy: { acquiredAt: 'desc' } },
     fieldUpdates: { select: { id: true, findings: true, description: true, source: true, teamId: true, observedAt: true, createdAt: true, latitude: true, longitude: true, attachments: { select: { id: true, filename: true, contentType: true, size: true } } }, take: 100, orderBy: { observedAt: 'desc' } },
     verifications: { select: { id: true, outcome: true, previousStatus: true, newStatus: true, reason: true, authorityReference: true, fieldUpdateId: true, correctedDecisionId: true, createdAt: true }, take: 100, orderBy: { createdAt: 'desc' } },
-    analyses: { select: { id: true, contextRevision: true, status: true, output: true, evidenceLevel: true, impactLevel: true, suggestedPriority: true, model: true, schemaVersion: true, promptVersion: true, ruleVersion: true, failureCode: true, startedAt: true, completedAt: true }, take: 20, orderBy: { startedAt: 'desc' } },
+    analyses: { select: { id: true, input: true, contextRevision: true, status: true, output: true, evidenceLevel: true, impactLevel: true, suggestedPriority: true, model: true, schemaVersion: true, promptVersion: true, ruleVersion: true, failureCode: true, startedAt: true, completedAt: true }, take: 20, orderBy: { startedAt: 'desc' } },
     assignments: { select: { id: true, caseId: true, teamId: true, status: true, notes: true, createdAt: true, updatedAt: true, team: { select: { id: true, name: true } } }, take: 100, orderBy: { createdAt: 'desc' } },
   } });
   if (!c) throw new AppError('Case not found', 404, 'NOT_FOUND');
@@ -47,11 +49,13 @@ export async function getCase(id: string, actor?: Actor) {
   });
   const { forecast, windContext } = await loadWindContext(db(), c.region);
   const weather = forecast && windContext.forecast ? [{ ...windContext.forecast, temperature: forecast.temperature, humidity: forecast.humidity, windSpeed: windContext.windSpeedKmh, windSpeedUnit: 'km/h', windFromDegrees: windContext.windFromDegrees, windToDegrees: windContext.windToDegrees, directionPrecision: 'CARDINAL', measurementType: 'FORECAST', stale: !['READY', 'CALM', 'MISSING_WIND'].includes(windContext.status) }] : [];
-  const spatialContext = c.regionId ? await db().msMapFeature.findMany({ where: { regionId: c.regionId, layer: { verifiedAt: { not: null } } }, select: { id: true, name: true, kind: true, layer: { select: { provider: true, attribution: true, sourceDate: true, version: true } } }, take: 100 }) : [];
+  const spatialContext = c.regionId ? await db().msMapFeature.findMany({ where: { regionId: c.regionId, layer: { verifiedAt: { not: null } } }, select: { id: true, name: true, kind: true, layerId: true, geometry: true, attributes: true, layer: { select: { provider: true, license: true, attribution: true, sourceDate: true, importedAt: true, verifiedAt: true, version: true } } }, take: 100 }) : [];
+  const conditions = spatialContext.length ? await db().trOperationalUpdate.findMany({ where: { featureId: { in: spatialContext.map(f => f.id) }, observedAt: { lte: new Date() } }, distinct: ['featureId'], orderBy: [{ featureId: 'asc' }, { observedAt: 'desc' }], select: { id: true, featureId: true, condition: true, source: true, observedAt: true }, take: 100 }) : [];
+  const exposure = buildExposure(c, spatialContext, conditions, windContext);
   const perimeter = polygonSchema.safeParse(c.perimeter);
   const currentActor = actor ? await db().msUser.findUnique({ where: { id: actor.id }, select: { role: true, active: true, emailVerified: true } }) : null;
   const activeAssignmentCount = await db().trAssignment.count({ where: { caseId: id, status: { in: [...activeAssignments] } } });
-  return { ...c, operatorAuthorityConfigured: !!currentActor && effectiveCapabilities(currentActor).canConfirmIncidents, activeAssignmentCount, areaHectares: perimeter.success ? areaHectares(perimeter.data) : null, reports: c.reports.map(reportDto), priorityHistory, timeline: timeline.map(({ actor: _actor, ...entry }) => entry), weather, windContext, spatialContext };
+  return { ...c, analyses: c.analyses.map(({ input, ...analysis }) => ({ ...analysis, sources: citationSources(input) })), operatorAuthorityConfigured: !!currentActor && effectiveCapabilities(currentActor).canConfirmIncidents, activeAssignmentCount, areaHectares: perimeter.success ? areaHectares(perimeter.data) : null, reports: c.reports.map(reportDto), priorityHistory, timeline: timeline.map(({ actor: _actor, ...entry }) => entry), weather, windContext, spatialContext, exposure };
 }
 export async function createCase(actor: Actor, body: unknown) {
   const { reason, ...data } = caseSchema.parse(body);
@@ -207,20 +211,21 @@ export async function submitReportAction(actor: Actor, id: string, body: unknown
       }
       const progress = await tx.trReportProgress.create({ data: { reportId: id, actorId: actor.id, stage, description: input.description, idempotencyKey: input.idempotencyKey, payloadHash: hash } });
       progressId = progress.id;
-      const observedAt = new Date();
-      const field = await tx.trFieldUpdate.create({ data: { caseId: incident.id, recorderId: actor.id, findings: 'VISIBLE_FIRE', description: input.description, source: reviewerAssessmentSource, observedAt } });
+      const evidence = input.confirmed.evidence;
+      const observedAt = new Date(evidence.observedAt);
+      const field = await tx.trFieldUpdate.create({ data: { caseId: incident.id, recorderId: actor.id, ...evidence, description: input.description, observedAt } });
       fieldUpdateId = field.id;
       await attach(tx, actor, input.attachmentIds, { reportProgressId: progress.id, fieldUpdateId: field.id });
       const correction = incident.verificationStatus !== 'UNVERIFIED';
       const prior = correction ? await tx.trVerification.findFirst({ where: { caseId: incident.id, outcome: { not: 'INCONCLUSIVE' } }, orderBy: { createdAt: 'desc' } }) : null;
       const authorityReference = 'APPLICATION_ADMIN_ROLE';
       await tx.trVerification.create({ data: { caseId: incident.id, decidingAdminId: actor.id, fieldUpdateId: field.id, authorityReference, outcome: correction ? 'CORRECTION' : 'CONFIRMED_FIRE', previousStatus: incident.verificationStatus, newStatus: 'CONFIRMED_FIRE', reason: input.description, correctedDecisionId: prior?.id } });
-      const perimeterSource = reviewerAssessmentSource;
-      const updatedCase = await tx.trCase.update({ where: { id: incident.id, version: incident.version }, data: { verificationStatus: 'CONFIRMED_FIRE', perimeter: jsonValue(input.confirmed.perimeter), perimeterObservedAt: observedAt, perimeterSource, perimeterRevision: { increment: 1 }, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null } });
+      const perimeterSource = evidence.source;
+      const updatedCase = await tx.trCase.update({ where: { id: incident.id, version: incident.version }, data: { verificationStatus: 'CONFIRMED_FIRE', latitude: evidence.latitude, longitude: evidence.longitude, perimeter: jsonValue(input.confirmed.perimeter), perimeterObservedAt: observedAt, perimeterSource, perimeterRevision: { increment: 1 }, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null } });
       await tx.trReport.update({ where: { id }, data: { reviewStatus: 'REVIEWED', caseId: incident.id } });
-      await audit(tx, actor.id, 'REVIEWER_ASSESSMENT_RECORDED', 'CASE', incident.id, undefined, { fieldUpdateId: field.id, reportId: id, source: reviewerAssessmentSource, verificationBasis: 'OPERATOR_ASSESSMENT', independentFieldObservation: false, observationTimeBasis: 'RECORDED_AT', locationSource: 'OPERATOR_MAPPED_BOUNDARY' });
-      await audit(tx, actor.id, correction ? 'VERIFICATION_CORRECTED' : 'VERIFICATION_RECORDED', 'CASE', incident.id, input.description, { outcome: 'CONFIRMED_FIRE', previousStatus: incident.verificationStatus, newStatus: 'CONFIRMED_FIRE', authorityReference, authorityBasis: 'APPLICATION_ADMIN_ROLE', verificationBasis: 'OPERATOR_ASSESSMENT', independentFieldObservation: false, positionSourceFieldUpdateId: null, reportId: id });
-      await audit(tx, actor.id, 'CASE_PERIMETER_UPDATED', 'CASE', incident.id, input.description, { authorityReference, authorityBasis: 'APPLICATION_ADMIN_ROLE', verificationBasis: 'OPERATOR_ASSESSMENT', fieldUpdateId: field.id, reportId: id, before: { perimeter: incident.perimeter, observedAt: incident.perimeterObservedAt, source: incident.perimeterSource, revision: incident.perimeterRevision }, after: { perimeter: input.confirmed.perimeter, observedAt, source: perimeterSource, revision: updatedCase.perimeterRevision }, areaHectares: areaHectares(input.confirmed.perimeter) });
+      await audit(tx, actor.id, 'FIELD_UPDATE_ADDED', 'CASE', incident.id, undefined, { fieldUpdateId: field.id, reportId: id, verificationBasis: 'FIELD_OBSERVATION', independentFieldObservation: true, observationTimeBasis: 'OPERATOR_SUPPLIED', locationSource: 'FIELD_OBSERVATION' });
+      await audit(tx, actor.id, correction ? 'VERIFICATION_CORRECTED' : 'VERIFICATION_RECORDED', 'CASE', incident.id, input.description, { outcome: 'CONFIRMED_FIRE', previousStatus: incident.verificationStatus, newStatus: 'CONFIRMED_FIRE', authorityReference, authorityBasis: 'APPLICATION_ADMIN_ROLE', verificationBasis: 'FIELD_OBSERVATION', independentFieldObservation: true, positionSourceFieldUpdateId: field.id, reportId: id });
+      await audit(tx, actor.id, 'CASE_PERIMETER_UPDATED', 'CASE', incident.id, input.description, { authorityReference, authorityBasis: 'APPLICATION_ADMIN_ROLE', verificationBasis: 'FIELD_OBSERVATION', fieldUpdateId: field.id, reportId: id, before: { perimeter: incident.perimeter, observedAt: incident.perimeterObservedAt, source: incident.perimeterSource, revision: incident.perimeterRevision }, after: { perimeter: input.confirmed.perimeter, observedAt, source: perimeterSource, revision: updatedCase.perimeterRevision }, areaHectares: areaHectares(input.confirmed.perimeter) });
     } else {
       const reviewStatus = input.status === 'IN_PROGRESS' ? 'UNDER_REVIEW' : input.status;
       stage = reviewStatus;
@@ -373,7 +378,7 @@ export async function operations() {
     tx.msEquipment.findMany({ select: equipmentSelect, take: 300, orderBy: { name: 'asc' } }),
     tx.trOperationalUpdate.findMany({ select: updateSelect, take: 1000, orderBy: [{ observedAt: 'desc' }, { id: 'desc' }] }),
     tx.trAssignment.findMany({ select: { ...assignmentSelect, case: { select: { number: true, title: true, verificationStatus: true, handlingStatus: true } }, team: { select: { name: true } } }, orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }] }),
-    tx.msMapFeature.findMany({ where: { kind: { in: ['ROAD', 'RIVER', 'WATER_SOURCE'] } }, select: { id: true, name: true, kind: true, layer: { select: { provider: true, verifiedAt: true } } }, take: 300, orderBy: { name: 'asc' } }),
+    tx.msMapFeature.findMany({ where: { kind: { in: ['ROAD', 'RIVER', 'WATER_SOURCE', 'DESIGNATED_LOCATION'] } }, select: { id: true, name: true, kind: true, layer: { select: { provider: true, verifiedAt: true } } }, take: 300, orderBy: { name: 'asc' } }),
     tx.trAuditLog.findMany({ where: { systemActor: sampleActor, action: 'SAMPLE_OPERATION_CREATED', targetType: { in: ['TEAM', 'EQUIPMENT', 'FEATURE', 'OPERATIONAL_UPDATE'] } }, select: { targetType: true, targetId: true } }),
   ]), { isolationLevel: 'RepeatableRead', maxWait: 10000, timeout: 30000 });
   const sampleKeys = new Set(sampleAudits.map(item => `${item.targetType}:${item.targetId}`));
@@ -484,9 +489,11 @@ export async function addOperationalUpdate(actor: Actor, body: unknown, client: 
     }
     let authoritative = true;
     if (input.subjectType === 'FEATURE') {
+      await tx.$queryRaw`SELECT id FROM "MsMapFeature" WHERE id = ${input.subjectId} FOR UPDATE`;
       const feature = await tx.msMapFeature.findUniqueOrThrow({ where: { id: input.subjectId }, include: { layer: { select: { provider: true, verifiedAt: true } } } });
       const road = ['PASSABLE', 'RESTRICTED', 'IMPASSABLE'];
       const water = ['WATER_AVAILABLE', 'WATER_UNAVAILABLE'];
+      if (['AVAILABLE', 'UNAVAILABLE'].includes(input.condition) && feature.kind !== 'DESIGNATED_LOCATION') throw new AppError('Availability applies only to designated locations', 400, 'INVALID_CONDITION');
       if ((road.includes(input.condition) && feature.kind !== 'ROAD') || (water.includes(input.condition) && !['WATER_SOURCE', 'RIVER'].includes(feature.kind))) throw new AppError('Condition does not apply to this feature', 400, 'INVALID_CONDITION');
       authoritative = feature.layer.provider !== 'SAMPLE' && feature.layer.verifiedAt !== null;
       if (!authoritative && (feature.layer.provider !== 'SAMPLE' || input.condition !== 'UNKNOWN')) throw new AppError('Unverified map features cannot provide operational routing status', 409, 'UNVERIFIED_FEATURE');

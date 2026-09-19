@@ -12,6 +12,8 @@ import * as integrations from '../integrations/index.js';
 import * as publicApi from '../public/index.js';
 import * as notifications from '../notifications/index.js';
 import { searchPlaces } from '../public/places.js';
+import { saveWarning, warningAction, warningOptions } from '../admin/warnings.service.js';
+import { previewWeatherReference, saveWeatherReference } from '../admin/weather-reference.service.js';
 
 const router = Router();
 const expensive = rateLimit({ windowMs: 60000, limit: 6, standardHeaders: 'draft-8', legacyHeaders: false, message: { message: 'Too many requests', code: 'RATE_LIMIT' } });
@@ -46,12 +48,20 @@ router.post('/uploads/:id/finalize', writes, single((req, res) => uploads.finali
 router.get('/uploads/:id/download', single((req, res) => uploads.download(res.locals.actor as Actor, routeId(req))));
 router.use('/admin', adminGuard);
 router.get('/admin/enums', single(() => enums));
+router.get('/admin/warnings/options', single(() => warningOptions()));
+router.post('/admin/warnings', writes, single((req, res) => saveWarning(res.locals.actor as Actor, req.body), 201));
+router.patch('/admin/warnings/:id', writes, single((req, res) => saveWarning(res.locals.actor as Actor, req.body, routeId(req))));
+router.post('/admin/warnings/:id/action', writes, single((req, res) => warningAction(res.locals.actor as Actor, routeId(req), req.body)));
+router.post('/admin/weather-reference/preview', expensive, single((req, res) => previewWeatherReference(res.locals.actor as Actor, req.body)));
+router.patch('/admin/cases/:id/weather-reference', expensive, single((req, res) => saveWeatherReference(res.locals.actor as Actor, routeId(req), req.body)));
 router.get('/admin/layers', single(() => admin.listLayers()));
 router.post('/admin/layers', single((req, res) => admin.importLayer(res.locals.actor as Actor, req.body), 201));
 router.get('/admin/regions', single(req => admin.listRegions(req.query)));
 router.post('/admin/regions', single((req, res) => admin.createRegion(res.locals.actor as Actor, req.body), 201));
 router.get('/admin/features', list(req => admin.listFeatures(req.query)));
 router.get('/admin/hotspots', list(req => admin.listHotspots(req.query)));
+router.get('/admin/hotspots/:id/candidates', expensive, list((req, res) => admin.hotspotCandidates(res.locals.actor as Actor, routeId(req), req.query)));
+router.post('/admin/hotspots/:id/case', writes, single((req, res) => admin.createHotspotCase(res.locals.actor as Actor, routeId(req), req.body), 201));
 router.patch('/admin/hotspots/:id', single((req, res) => admin.associateHotspot(res.locals.actor as Actor, routeId(req), req.body)));
 router.get('/admin/cases', list(req => admin.listCases(req.query)));
 router.post('/admin/cases', single((req, res) => admin.createCase(res.locals.actor as Actor, req.body), 201));
@@ -65,6 +75,7 @@ router.post('/admin/cases/:id/assignments', single((req, res) => admin.assignTea
 router.patch('/admin/assignments/:id', single((req, res) => admin.updateAssignment(res.locals.actor as Actor, routeId(req), req.body)));
 router.get('/admin/reports', list((req, res) => reports.listReports(res.locals.actor as Actor, req.query, true)));
 router.get('/admin/reports/:id', single((req, res) => reports.getReport(res.locals.actor as Actor, routeId(req), true)));
+router.post('/admin/reports/:id/case', writes, single((req, res) => admin.createReportCase(res.locals.actor as Actor, routeId(req), req.body), 201));
 router.get('/admin/reports/:id/candidates', expensive, list((req, res) => admin.reportCandidates(res.locals.actor as Actor, routeId(req), req.query)));
 router.patch('/admin/reports/:id', single((req, res) => admin.reviewReport(res.locals.actor as Actor, routeId(req), req.body)));
 router.post('/admin/reports/:id/action', writes, single((req, res) => admin.submitReportAction(res.locals.actor as Actor, routeId(req), req.body), 201));

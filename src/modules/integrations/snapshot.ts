@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { buildExposure } from './exposure.js';
 import type { buildWindContext } from './wind.js';
 import { env } from '../../config/env.js';
 import { featureKinds, fieldFindings, latitudeSchema, longitudeSchema, operationalConditions, reviewerAssessmentSource, verificationStatuses } from '../../types/index.js';
@@ -24,6 +25,8 @@ export function buildAnalysisContext(caseValue: unknown, forecastValue: unknown,
   const forecast = forecastValue == null ? null : weatherSchema.parse(forecastValue);
   const spatial = spatialValues.map(value => spatialSchema.parse(value));
   const operational = operationalValues.map(value => operationalSchema.parse(value));
+  const location = z.object({ latitude: latitudeSchema.nullish(), longitude: longitudeSchema.nullish() }).parse(caseValue);
+  const exposure = buildExposure(location, spatialValues, [], windContext);
   const precision = env.AI_COORDINATE_PRECISION_DECIMALS;
   const facts = (value: object) => JSON.stringify({ ...value, limitations: [privacyLimitation] });
   const coordinate = (value: number | null) => coarsenCoordinate(value, precision);
@@ -37,7 +40,7 @@ export function buildAnalysisContext(caseValue: unknown, forecastValue: unknown,
   return {
     caseId: c.id, contextRevision: c.contextRevision, verificationStatus: c.verificationStatus, coordinatePrecision: { decimalPlaces: precision, method: 'DECIMAL_ROUNDING', exactCoordinatesShared: false }, observations, windContext,
     weather: forecast ? { id: forecast.id, provider: 'BMKG', issuedAt: forecast.issuedAt.toISOString(), validAt: forecast.validAt.toISOString(), fetchedAt: forecast.fetchedAt.toISOString(), temperature: forecast.temperature, humidity: forecast.humidity, windSpeed: forecast.windSpeed, windSpeedUnit: 'km/h', windFromDegrees: from, windToDegrees: from == null ? null : (from + 180) % 360, directionPrecision: 'CARDINAL', measurementType: 'FORECAST' } : null,
-    spatialContext: spatial.map(s => ({ id: s.id, name: ['FACILITY', 'SETTLEMENT', 'DESIGNATED_LOCATION'].includes(s.kind) ? s.name?.trim() || null : null, kind: s.kind, regionId: s.regionId, layerId: s.layerId, sourceDate: s.layer.sourceDate.toISOString(), importedAt: s.layer.importedAt.toISOString(), relationBasis: 'ADMINISTRATIVE_REGION_ONLY', distanceMeters: null, downwind: null })),
+    spatialContext: spatial.map(s => ({ id: s.id, name: ['FACILITY', 'SETTLEMENT', 'DESIGNATED_LOCATION'].includes(s.kind) ? s.name?.trim() || null : null, kind: s.kind, regionId: s.regionId, layerId: s.layerId, sourceDate: s.layer.sourceDate.toISOString(), importedAt: s.layer.importedAt.toISOString(), ...(() => { const e = exposure.items.find(e => e.id === s.id); return e?.distanceMeters != null ? { relationBasis: e.relationBasis, computedBy: 'BLAZEMAP', sourceId: e.sourceId, distanceMeters: Math.round(e.distanceMeters / 100) * 100, downwind: e.downwind, forecastId: e.forecastId, limitations: ['Distance rounded to 100 m; incident point, not perimeter; directional advisory only'] } : { relationBasis: 'ADMINISTRATIVE_REGION_ONLY', distanceMeters: null, downwind: null }; })() })),
     operationalContext: operational.map(o => ({ id: o.id, subjectType: o.subjectType, subjectId: o.subjectType === 'TEAM' ? o.teamId : o.subjectType === 'EQUIPMENT' ? o.equipmentId : o.featureId, condition: o.condition, observedAt: o.observedAt.toISOString() })),
   };
 }

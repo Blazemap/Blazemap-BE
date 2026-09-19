@@ -83,6 +83,19 @@ function segmentDistance(p: Position, a: Position, b: Position) {
 export function prepareGeometryDistance(geometry: unknown): ((point: Position) => number) | null {
   const parsedPoint = z.strictObject({ type: z.literal('Point'), coordinates: positionSchema }).safeParse(geometry);
   if (parsedPoint.success) return point => distanceMeters(point, parsedPoint.data.coordinates);
+  const line = z.strictObject({ type: z.literal('LineString'), coordinates: z.array(positionSchema).min(2).max(10000) }).safeParse(geometry);
+  if (line.success) {
+    const points = line.data.coordinates;
+    if (points.some((p, i) => i > 0 && Math.abs(p[0] - points[i - 1]![0]) >= 180)) return null;
+    return point => points.slice(1).reduce((distance, p, i) => Math.min(distance, segmentDistance(point, points[i]!, p)), Infinity);
+  }
+  const multi = z.strictObject({ type: z.literal('MultiPolygon'), coordinates: z.array(z.array(z.array(positionSchema))).min(1).max(100) }).safeParse(geometry);
+  if (multi.success) {
+    if (multi.data.coordinates.flat(2).length > 10000) return null;
+    const distances = multi.data.coordinates.map(coordinates => prepareGeometryDistance({ type: 'Polygon', coordinates }));
+    if (distances.some(distance => !distance)) return null;
+    return point => Math.min(...distances.map(distance => distance!(point)));
+  }
   const parsed = polygonSchema.safeParse(geometry);
   if (!parsed.success) return null;
   const rings = parsed.data.coordinates;

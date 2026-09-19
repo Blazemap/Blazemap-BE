@@ -89,18 +89,19 @@ export async function syncSource(source: string, body: unknown, actor?: Actor, c
     scope = { products: requestedProducts, areas, days: 2 };
   } else {
     const refreshBefore = new Date(Date.now() - pollIntervals().BMKG);
-    regions = input.regionIds ? await client.msRegion.findMany({ where: { verifiedAt: { not: null }, bmkgAdm4: { not: null }, id: { in: input.regionIds } }, select: { id: true, bmkgAdm4: true }, take: 30 }) : await client.$queryRaw<{ id: string; bmkgAdm4: string | null }[]>`
+    regions = input.regionIds ? await client.msRegion.findMany({ where: { verifiedAt: { not: null }, level: 4, bmkgAdm4: { not: null }, id: { in: input.regionIds } }, select: { id: true, bmkgAdm4: true }, take: 30 }) : await client.$queryRaw<{ id: string; bmkgAdm4: string | null }[]>`
       SELECT r.id, r."bmkgAdm4" FROM "MsRegion" r
       LEFT JOIN LATERAL (SELECT max(f."fetchedAt") AS fetched FROM "TrWeatherForecast" f WHERE f."regionId" = r.id AND f.provider = 'BMKG') latest ON true
-      WHERE r."verifiedAt" IS NOT NULL AND r."bmkgAdm4" IS NOT NULL
+      WHERE r."verifiedAt" IS NOT NULL AND r.level = 4 AND r."bmkgAdm4" ~ '^[0-9]{2}[.][0-9]{2}[.][0-9]{2}[.][0-9]{4}$'
         AND EXISTS (SELECT 1 FROM "TrCase" c WHERE c."regionId" = r.id AND c."handlingStatus" != 'CLOSED')
         AND (latest.fetched IS NULL OR latest.fetched <= ${refreshBefore})
       ORDER BY latest.fetched ASC NULLS FIRST, r.id LIMIT 30`;
     if (input.regionIds && regions.length !== input.regionIds.length) throw unavailable('Verified BMKG region mappings');
     if (!regions.length) return { id: null, provider, status: 'NO_DUE_REGIONS', received: 0, imported: 0, deduplicated: 0 };
+    if (regions.some(region => !region.bmkgAdm4 || !/^\d{2}\.\d{2}\.\d{2}\.\d{4}$/.test(region.bmkgAdm4))) throw new AppError('Verified BMKG ADM4 mapping required', 503, 'BMKG_MAPPING_INVALID');
     const due: typeof regions = [];
     for (const region of regions) {
-      const latest = await client.trWeatherForecast.findFirst({ where: { regionId: region.id }, orderBy: { fetchedAt: 'desc' }, select: { fetchedAt: true } });
+      const latest = await client.trWeatherForecast.findFirst({ where: { provider: 'BMKG', regionId: region.id }, orderBy: { fetchedAt: 'desc' }, select: { fetchedAt: true } });
       if (!latest || latest.fetchedAt <= refreshBefore) due.push(region);
     }
     if (!due.length) return { id: null, provider, status: 'CACHED', received: 0, imported: 0, deduplicated: 0 };
@@ -165,7 +166,7 @@ export async function syncSource(source: string, body: unknown, actor?: Actor, c
       }
     } else {
       for (const region of regions) {
-        const refreshed = await client.trWeatherForecast.findFirst({ where: { regionId: region.id }, orderBy: { fetchedAt: 'desc' }, select: { fetchedAt: true } });
+        const refreshed = await client.trWeatherForecast.findFirst({ where: { provider: 'BMKG', regionId: region.id }, orderBy: { fetchedAt: 'desc' }, select: { fetchedAt: true } });
         if (refreshed && Date.now() - refreshed.fetchedAt.getTime() < pollIntervals().BMKG) continue;
         if (Date.now() - run.startedAt.getTime() > 480000) throw unavailable('BMKG run time limit');
         stage = 'FETCH';

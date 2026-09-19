@@ -21,7 +21,7 @@ async function runAnalysis(actor: Actor | null, id: string, expectedRevision?: n
     else if (!reevaluationAllowed()) throw new AppError('Automatic analysis is not enabled', 403, 'FORBIDDEN');
     await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${id} FOR UPDATE`;
     const c = await tx.trCase.findUniqueOrThrow({ where: { id }, select: {
-      id: true, contextRevision: true, verificationStatus: true, handlingStatus: true, latestAnalysisId: true, regionId: true,
+      id: true, latitude: true, longitude: true, contextRevision: true, verificationStatus: true, handlingStatus: true, latestAnalysisId: true, regionId: true,
       latestAnalysis: { select: { contextRevision: true, status: true } },
       region: { select: { id: true, name: true, level: true, bmkgAdm4: true, verifiedAt: true } },
       reports: { select: { id: true, observationTypes: true, observedAt: true, locationMode: true, latitude: true, longitude: true, updates: { select: { id: true, kind: true, createdAt: true }, orderBy: { createdAt: 'desc' }, take: 20 } }, take: 100, orderBy: { observedAt: 'desc' } },
@@ -43,7 +43,7 @@ async function runAnalysis(actor: Actor | null, id: string, expectedRevision?: n
     const now = new Date();
     const wind = await loadWindContext(tx, c.region, now);
     const forecast = ['READY', 'CALM', 'MISSING_WIND'].includes(wind.windContext.status) ? wind.forecast : null;
-    const spatial = c.regionId ? await tx.msMapFeature.findMany({ where: { regionId: c.regionId, layer: { verifiedAt: { not: null } } }, select: { id: true, name: true, kind: true, regionId: true, layerId: true, layer: { select: { sourceDate: true, importedAt: true } } }, take: 100 }) : [];
+    const spatial = c.regionId ? await tx.msMapFeature.findMany({ where: { regionId: c.regionId, layer: { verifiedAt: { not: null } } }, select: { id: true, name: true, kind: true, regionId: true, layerId: true, geometry: true, attributes: true, layer: { select: { sourceDate: true, importedAt: true, provider: true, license: true, attribution: true, verifiedAt: true } } }, take: 100 }) : [];
     const operational = await tx.trOperationalUpdate.findMany({ where: { observedAt: { gt: new Date(now.getTime() - 86400000), lte: now }, OR: [{ team: { assignments: { some: { caseId: id, status: { in: ['ASSIGNED', 'ACCEPTED', 'IN_PROGRESS'] } } } } }, { equipment: { team: { assignments: { some: { caseId: id, status: { in: ['ASSIGNED', 'ACCEPTED', 'IN_PROGRESS'] } } } } } }, ...(c.regionId ? [{ feature: { regionId: c.regionId } }] : [])] }, select: { id: true, subjectType: true, teamId: true, equipmentId: true, featureId: true, condition: true, observedAt: true }, take: 100, orderBy: { observedAt: 'desc' } });
     let context: ReturnType<typeof buildAnalysisContext>;
     try {

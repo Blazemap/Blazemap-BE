@@ -283,6 +283,8 @@ model TrHotspot {
 }
 model TrCase {
   id String @id @default(cuid())
+  bmkgAdm4Reference String?
+  weatherReference Json?
   number String @unique
   title String
   latitude Float?

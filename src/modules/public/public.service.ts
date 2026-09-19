@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { db, databaseAvailable, emailAvailable, uploadsAvailable, env } from '../../config/index.js';
+import { db, databaseAvailable, emailAvailable, uploadsAvailable, env, pollIntervals } from '../../config/index.js';
 import { googleAvailable } from '../../config/env.js';
 import { AppError } from '../../utils/index.js';
 import type { PrismaClient } from '../../generated/prisma/client.js';
@@ -21,13 +21,38 @@ export function firmsSourceStatus(configured: boolean, latest: string | null, la
   return { status: 'AVAILABLE', message: 'FIRMS last sync succeeded. Detections shown are limited to the requested window and configured source coverage.', ...lastSuccessAt };
 }
 
+export async function bmkgSourceStatus(client: PrismaClient = db(), now = Date.now()) {
+  const [last, success, eligible] = await Promise.all([
+    client.trIntegrationRun.findFirst({ where: { provider: 'BMKG' }, orderBy: { startedAt: 'desc' }, select: { status: true, startedAt: true } }),
+    client.trIntegrationRun.findFirst({ where: { provider: 'BMKG', status: 'SUCCEEDED', received: { gt: 0 } }, orderBy: { completedAt: 'desc' }, select: { completedAt: true } }),
+    client.$queryRaw<{ id: string }[]>`SELECT r.id FROM "MsRegion" r
+      WHERE r."verifiedAt" IS NOT NULL AND r.level = 4 AND r."bmkgAdm4" ~ '^[0-9]{2}[.][0-9]{2}[.][0-9]{2}[.][0-9]{4}$'
+        AND EXISTS (SELECT 1 FROM "TrCase" c WHERE c."regionId" = r.id AND c."handlingStatus" != 'CLOSED') LIMIT 1`,
+  ]);
+  const lastSuccessAt = success?.completedAt ? { lastSuccessAt: success.completedAt.toISOString() } : {};
+  if (last?.status === 'FAILED') return { status: 'UNAVAILABLE', message: 'Latest BMKG sync failed. Check worker logs for the failure code; provider availability is not established by this status.', ...lastSuccessAt };
+  if (last?.status === 'RUNNING') return now - last.startedAt.getTime() > 600000
+    ? { status: 'UNAVAILABLE', message: 'BMKG sync has not completed within ten minutes. Check the source worker and database logs.', ...lastSuccessAt }
+    : { status: 'RUNNING', message: 'BMKG sync is in progress; no new successful result yet.', ...lastSuccessAt };
+  if (!success?.completedAt) {
+    const message = !eligible.length
+      ? 'No open case has an eligible verified level IV ADM4 mapping. Automatic BMKG sync has no region to fetch; this does not indicate a provider outage.'
+      : !last
+        ? 'No BMKG sync attempt recorded for eligible regions. Check that the source worker or BMKG cron is running.'
+        : 'No successful BMKG observations recorded. The latest run was skipped or produced no observations; check the source worker logs.';
+    return { status: 'NOT_SYNCED', message };
+  }
+  if (now - success.completedAt.getTime() > pollIntervals().BMKG + 600000) return { status: 'STALE', message: eligible.length ? 'BMKG has not refreshed within the configured polling interval plus ten minutes. Check the source worker or cron logs.' : 'Retained BMKG forecasts are stale. No open case currently has an eligible verified ADM4 mapping for automatic refresh.', ...lastSuccessAt };
+  return { status: 'AVAILABLE', message: 'BMKG observations were stored successfully within the polling interval. This is a regional forecast, not a live measurement or coverage of every case.', ...lastSuccessAt };
+}
+
 async function sourceStatus() {
   const connected = await databaseAvailable();
   const sources = [];
-  for (const [id, name, configured, maxAge] of [
-    ['FIRMS', 'NASA FIRMS', firmsConfigured(), 3600000],
-    ['BMKG', 'BMKG Forecast', true, 86400000],
-    ['AI', 'AI analysis', !!(env.AI_SERVICE_URL && env.AI_SERVICE_TOKEN), 86400000],
+  for (const [id, name, configured] of [
+    ['FIRMS', 'NASA FIRMS', firmsConfigured()],
+    ['BMKG', 'BMKG Forecast', true],
+    ['AI', 'AI analysis', !!(env.AI_SERVICE_URL && env.AI_SERVICE_TOKEN)],
   ] as const) {
     if (!connected) { sources.push({ id, name, status: 'UNAVAILABLE', message: 'Database unavailable' }); continue; }
     if (!configured && id !== 'FIRMS') { sources.push({ id, name, status: 'NOT_CONFIGURED', message: `${name} is not configured` }); continue; }
@@ -36,9 +61,9 @@ async function sourceStatus() {
       sources.push({ id, name, status: latest?.status === 'FAILED' ? 'UNAVAILABLE' : latest ? latest.status : 'NOT_SYNCED', ...(latest?.status === 'SUCCEEDED' ? { lastSuccessAt: latest.completedAt } : {}) });
       continue;
     }
+    if (id === 'BMKG') { sources.push({ id, name, ...await bmkgSourceStatus() }); continue; }
     const [last, success] = await Promise.all([db().trIntegrationRun.findFirst({ where: { provider: id, status: { in: ['SUCCEEDED', 'FAILED'] } }, orderBy: { startedAt: 'desc' }, select: { status: true } }), db().trIntegrationRun.findFirst({ where: { provider: id, status: 'SUCCEEDED' }, orderBy: { completedAt: 'desc' }, select: { completedAt: true } })]);
-    if (id === 'FIRMS') { sources.push({ id, name, ...firmsSourceStatus(configured, last?.status ?? null, success?.completedAt ?? null) }); continue; }
-    sources.push({ id, name, status: last?.status === 'FAILED' ? 'UNAVAILABLE' : !success?.completedAt ? 'NOT_SYNCED' : Date.now() - success.completedAt.getTime() > maxAge ? 'STALE' : 'AVAILABLE', ...(success?.completedAt ? { lastSuccessAt: success.completedAt } : {}), ...(last?.status === 'FAILED' ? { message: 'Latest source request failed; retained data may be stale' } : {}) });
+    sources.push({ id, name, ...firmsSourceStatus(configured, last?.status ?? null, success?.completedAt ?? null) });
   }
   return { database: connected ? 'connected' : 'unavailable', sources, uploadsAvailable, emailAvailable, googleAvailable };
 }

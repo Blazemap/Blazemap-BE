@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Prisma, PrismaClient } from '../../generated/prisma/client.js';
 import { db, env } from '../../config/index.js';
-import { publicationSchema, publishSchema, outcomePublicationSchema, withdrawalSchema, settingsSchema, informationQuerySchema, type Actor, type Transaction } from '../../types/index.js';
+import { warningSnapshotSchema, publicationSchema, publishSchema, outcomePublicationSchema, withdrawalSchema, settingsSchema, informationQuerySchema, type Actor, type Transaction } from '../../types/index.js';
 import { AppError, jsonValue, fingerprint } from '../../utils/index.js';
 import { areaHectares, publicPerimeter, publicPerimeterSchema } from '../../utils/geometry.js';
 import { audit, lockedActor, verifiedRegion } from './access.js';
@@ -30,8 +30,9 @@ export function publicationDto<T extends { regions: { region: unknown }[]; valid
   const now = new Date();
   const parent = publicLinkSchema.safeParse(supersedes);
   const context = publicCaseContextSchema.safeParse(publicCaseSnapshot);
+  const advisory = warningSnapshotSchema.safeParse(publicCaseSnapshot);
   return {
-    ...fields, publicLatitude: point.latitude, publicLongitude: point.longitude, ...point, ...publicPerimeter(location), ...(context.success ? { caseNumber: context.data.number, handlingStatus: context.data.handlingStatus, windContext: context.data.windContext ?? null } : {}), regions: item.regions.map(v => v.region), expired: !!item.validUntil && item.validUntil <= now,
+    ...fields, ...(advisory.success ? { advisory: advisory.data } : {}), publicLatitude: point.latitude, publicLongitude: point.longitude, ...point, ...publicPerimeter(location), ...(context.success ? { caseNumber: context.data.number, handlingStatus: context.data.handlingStatus, windContext: context.data.windContext ?? null } : {}), regions: item.regions.map(v => v.region), expired: !!item.validUntil && item.validUntil <= now,
     supersedesId: parent.success && parent.data.publishedAt <= now ? parent.data.id : null,
     replacements: (replacements ?? []).flatMap(value => {
       const link = publicLinkSchema.safeParse(value);
@@ -52,6 +53,7 @@ export async function listInformation(query: unknown, admin = false, client: Pri
   const filters: Prisma.TrPublicInformationWhereInput[] = [
     ...(active ? [activePublicationWhere({ active, type }, now)] : []),
     ...(feed ? [{ OR: [{ validUntil: null }, { validUntil: { gt: now } }] }] : []),
+    ...(news || feed ? [{ type: { not: 'WARNING' as const } }] : []),
     ...(search ? [{ OR: [{ title: { contains: search, mode: 'insensitive' as const } }, { summary: { contains: search, mode: 'insensitive' as const } }] }] : []),
   ];
   const where: Prisma.TrPublicInformationWhereInput = { ...(admin ? {} : { status: 'PUBLISHED', publishedAt: { lte: now } }), type, ...(feed ? { status: 'PUBLISHED', caseId: { not: null }, privacyReview: { not: null }, publishedAt: { lte: now, ...(from ? { gte: new Date(from) } : {}) } } : {}), ...(news ? { status: 'PUBLISHED', publishedAt: { lte: now }, privacyReview: { not: null }, OR: [{ outcome: 'DECLINED' }, { caseId: { not: null }, AND: [{ publicCaseSnapshot: { path: ['verificationStatus'], equals: 'CONFIRMED_FIRE' } }, { publicCaseSnapshot: { path: ['handlingStatus'], equals: 'CLOSED' } }] }] } : {}), ...(regionId ? { regions: { some: { regionId } } } : {}), ...(filters.length ? { AND: filters } : {}) };
@@ -75,6 +77,7 @@ export async function saveInformation(actor: Actor, body: unknown, id?: string, 
     if (id) await tx.$queryRaw`SELECT id FROM "TrPublicInformation" WHERE id = ${id} FOR UPDATE`;
     const old = id ? await tx.trPublicInformation.findUniqueOrThrow({ where: { id }, include: { regions: true } }) : null;
     const input = publicationSchema.parse(old ? { title: old.title, summary: old.summary, body: old.body, type: old.type, outcome: old.outcome, reportId: old.reportId, sources: old.sources, regionIds: old.regions.map(r => r.regionId), caseId: old.caseId, validUntil: old.validUntil?.toISOString() ?? null, publicLocationMode: old.publicLocationMode, publicLatitude: old.publicLatitude, publicLongitude: old.publicLongitude, privacyReview: old.privacyReview, ...patch } : body);
+    if (input.type === 'WARNING' || old?.type === 'WARNING') throw new AppError('Use the controlled warning workflow', 400, 'WARNING_WORKFLOW_REQUIRED');
     await validateRegions(tx, input.regionIds);
     const { regionIds, validUntil, ...fields } = input;
     const data = { ...fields, sources: jsonValue(fields.sources), validUntil: validUntil ? new Date(validUntil) : null, publicLatitude: fields.publicLocationMode === 'APPROVED_INCIDENT_POINT' ? fields.publicLatitude : null, publicLongitude: fields.publicLocationMode === 'APPROVED_INCIDENT_POINT' ? fields.publicLongitude : null };
@@ -97,11 +100,11 @@ export async function publishInformation(actor: Actor, id: string, body: unknown
     await lockedActor(tx, actor, true, 'canPublishInformation');
     await tx.$queryRaw`SELECT id FROM "TrPublicInformation" WHERE id = ${id} FOR UPDATE`;
     const item = await tx.trPublicInformation.findUniqueOrThrow({ where: { id }, include: { regions: true } });
+    if (item.type === 'WARNING') throw new AppError('Use the controlled warning workflow', 400, 'WARNING_WORKFLOW_REQUIRED');
     if (item.status !== 'DRAFT') throw new AppError('Only drafts can be published', 409, 'INVALID_PUBLICATION_STATE');
     assertPublicationRevision(item.updatedAt, input.expectedUpdatedAt);
     if (!Array.isArray(item.sources) || !item.sources.length) throw new AppError('At least one factual source is required', 400, 'SOURCES_REQUIRED');
     if (item.validUntil && item.validUntil <= new Date()) throw new AppError('Validity must end after publication', 400, 'INVALID_VALIDITY');
-    if (item.type === 'WARNING' && !item.validUntil) throw new AppError('Warnings require a validity end time', 400, 'VALIDITY_REQUIRED');
     await validateRegions(tx, item.regions.map(v => v.regionId));
     if (item.outcome) {
       if (!item.privacyReview?.trim()) throw new AppError('News requires explicit privacy review', 400, 'PRIVACY_REVIEW_REQUIRED');
@@ -193,7 +196,7 @@ export async function withdrawInformation(actor: Actor, id: string, body: unknow
   const { reason } = withdrawalSchema.parse(body);
   return db().$transaction(async tx => {
     await lockedActor(tx, actor, true, 'canPublishInformation');
-    const updated = await tx.trPublicInformation.update({ where: { id, status: 'PUBLISHED' }, data: { status: 'WITHDRAWN', withdrawalReason: reason }, select: publicationSelect() });
+    const updated = await tx.trPublicInformation.update({ where: { id, status: 'PUBLISHED', type: { not: 'WARNING' } }, data: { status: 'WITHDRAWN', withdrawalReason: reason }, select: publicationSelect() });
     await tx.trAttachment.updateMany({ where: { publicationId: id }, data: { revokedAt: new Date() } });
     await audit(tx, actor.id, 'INFORMATION_WITHDRAWN', 'PUBLICATION', id, reason);
     return publicationDto(updated);

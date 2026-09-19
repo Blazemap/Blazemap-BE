@@ -17,6 +17,7 @@ export async function listCitizenFeed(actor: Actor, query: unknown, client: Pris
   const ownWhere: Prisma.TrReportWhereInput = { reporterId: actor.id };
   const publicationWhere: Prisma.TrPublicInformationWhereInput = {
     status: 'PUBLISHED',
+    type: { not: 'WARNING' },
     caseId: { not: null },
     case: { is: { verificationStatus: 'CONFIRMED_FIRE' } },
     privacyReview: { not: null },
