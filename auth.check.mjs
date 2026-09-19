@@ -2,10 +2,13 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { Buffer } from 'node:buffer';
 import ts from 'typescript';
+import { effectiveCapabilities } from './src/modules/admin/rules.ts';
 import { getIP } from '@better-auth/core/utils/ip';
 const source = await readFile(new URL('./src/config/auth.ts', import.meta.url), 'utf8');
 const compiled = ts.transpileModule(source
   .replace("import { betterAuth } from 'better-auth';", 'const betterAuth = options => options;')
+  .replace("import { customSession } from 'better-auth/plugins';", 'const customSession = callback => callback;')
+  .replace("import { effectiveCapabilities } from '../modules/admin/rules.js';", `const effectiveCapabilities = ${effectiveCapabilities.toString()};`)
   .replace("import { prismaAdapter } from 'better-auth/adapters/prisma';", 'const prismaAdapter = () => ({});')
   .replace("import { APIError } from 'better-auth/api';", 'class APIError extends Error {}')
   .replace("import nodemailer from 'nodemailer';", 'const nodemailer = {};')
@@ -24,6 +27,16 @@ assert.equal((await config.databaseHooks.user.create.before({ image: provider },
 assert.equal(created.data.role, 'USER');
 assert.equal(created.data.canConfirmIncidents, false);
 assert.equal(created.data.canPublishInformation, false);
+const escalated = await config.databaseHooks.user.create.before({ role: 'ADMIN', canConfirmIncidents: true, canPublishInformation: true }, { path: '/sign-up/email' });
+assert.equal(escalated.data.role, 'USER');
+assert.equal(escalated.data.canConfirmIncidents, false);
+assert.equal(escalated.data.canPublishInformation, false);
+for (const field of ['role', 'active', 'canConfirmIncidents', 'canPublishInformation']) assert.equal(config.user.additionalFields[field].input, false);
+for (const role of ['ADMIN', 'USER']) {
+  const session = await config.plugins[0]({ user: { role, active: true, emailVerified: true, canConfirmIncidents: role === 'USER', canPublishInformation: role === 'USER' }, session: { id: 'session' } });
+  assert.equal(session.user.canConfirmIncidents, role === 'ADMIN');
+  assert.equal(session.user.canPublishInformation, role === 'ADMIN');
+}
 await config.user.validateUserInfo({ user: { id: 'fixture', image: provider, emailVerified: true }, source: { action: 'sign-in', oauth: { providerId: 'google' } } });
 assert.equal(image, provider);
 image = 'avatars/custom-upload';

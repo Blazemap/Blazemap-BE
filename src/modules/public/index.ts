@@ -1,1 +1,1 @@
-export { status, publicMap, regions } from './public.service.js';
+export { status, publicMap, roleMap, regions } from './public.service.js';

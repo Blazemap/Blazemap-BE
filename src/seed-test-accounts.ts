@@ -3,18 +3,18 @@ import { execFileSync } from 'node:child_process';
 import { open, readFile, unlink } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { parseArgs } from 'node:util';
+import { isDeepStrictEqual, parseArgs } from 'node:util';
 import { hashPassword, verifyPassword } from 'better-auth/crypto';
 import { z } from 'zod';
 import type { PrismaClient } from './generated/prisma/client.js';
 import { db, disconnect } from './config/db.js';
 
 export const testIdentities = [
-  { email: 'govt-test@blazemap.test', name: 'TEST Government Login Fixture (No Mandate)', role: 'ADMIN' as const },
-  { email: 'user-test@blazemap.test', name: 'TEST Regular Login Fixture', role: 'USER' as const },
-  ...Array.from({ length: 5 }, (_, index) => ({ email: `reporter${String(index + 1).padStart(2, '0')}@blazemap.test`, name: `TEST Reporter ${String(index + 1).padStart(2, '0')} Login Fixture`, role: 'USER' as const })),
+  { email: 'govt@blazemap.test', name: 'Arif Pradana', role: 'ADMIN' as const },
+  { email: 'user@blazemap.test', name: 'Nadia Kusumawati', role: 'USER' as const },
+  ...['Bayu Wicaksana', 'Rani Puspitasari', 'Dimas Setiawan', 'Sinta Maharani', 'Fajar Nugraha'].map((name, index) => ({ email: `reporter${String(index + 1).padStart(2, '0')}@blazemap.test`, name, role: 'USER' as const })),
 ];
-const credentialSchema = z.strictObject({ purpose: z.literal('TEST_LOGIN_FIXTURES_ONLY_NO_OPERATIONAL_MANDATE'), accounts: z.array(z.strictObject({ id: z.string(), email: z.email(), name: z.string(), role: z.enum(['USER', 'ADMIN']), password: z.string().min(20).max(128) })).length(7) });
+const credentialSchema = z.strictObject({ purpose: z.literal('TEST_LOGIN_FIXTURES_ONLY_NO_OPERATIONAL_MANDATE'), accounts: z.array(z.strictObject({ id: z.string(), email: z.email(), name: z.string(), role: z.enum(['USER', 'ADMIN']), password: z.string().min(24).max(128) })).length(7) });
 const where = { email: { in: testIdentities.map(identity => identity.email) } };
 
 export async function seedTestAccounts(client: PrismaClient, file: string) {
@@ -22,10 +22,13 @@ export async function seedTestAccounts(client: PrismaClient, file: string) {
   if (existing.length) {
     const saved = credentialSchema.parse(JSON.parse(await readFile(file, 'utf8')));
     if (existing.length !== 7 || new Set(saved.accounts.map(account => account.email)).size !== 7) throw new Error('Fixture collision');
+    const audits = await client.trAuditLog.findMany({ where: { systemActor: 'test-account-seeder', action: 'TEST_ACCOUNT_CREATED', targetType: 'USER', targetId: { in: existing.map(user => user.id) } } });
     for (const identity of testIdentities) {
       const user = existing.find(user => user.email === identity.email);
       const credential = saved.accounts.find(account => account.email === identity.email);
       const account = user?.accounts.find(account => account.providerId === 'credential');
+      const evidence = audits.filter(audit => audit.targetId === user?.id);
+      if (evidence.length !== 1 || !isDeepStrictEqual(evidence[0]?.details, { email: identity.email, role: identity.role, emailVerified: true, verificationBasis: 'EXPLICIT_TEST_FIXTURE_BYPASS', fictionalIdentity: true, canConfirmIncidents: false, canPublishInformation: false })) throw new Error('Fixture audit provenance mismatch');
       if (!user || !credential || user.name !== identity.name || credential.name !== identity.name || user.role !== identity.role || credential.role !== identity.role || credential.id !== user.id || !user.active || !user.emailVerified || user.canConfirmIncidents || user.canPublishInformation || user.accounts.length !== 1 || account?.accountId !== user.id || !account.password || !await verifyPassword({ hash: account.password, password: credential.password })) throw new Error('Fixture collision or credentials unavailable');
     }
     return { created: 0, verified: 7 };
@@ -49,7 +52,7 @@ export async function seedTestAccounts(client: PrismaClient, file: string) {
       for (const [index, account] of accounts.entries()) {
         const { password: _password, ...identity } = account;
         await tx.msUser.create({ data: { ...identity, active: true, emailVerified: true, canConfirmIncidents: false, canPublishInformation: false, accounts: { create: { id: randomUUID(), accountId: account.id, providerId: 'credential', password: hashes[index]! } } } });
-        await tx.trAuditLog.create({ data: { systemActor: 'test-account-seeder', action: 'TEST_ACCOUNT_CREATED', targetType: 'USER', targetId: account.id, reason: 'Explicitly authorized test login fixture; exact .test identity verification bypass only; no operational mandate', details: { email: account.email, role: account.role, emailVerified: true, verificationBasis: 'EXPLICIT_TEST_FIXTURE_BYPASS', canConfirmIncidents: false, canPublishInformation: false } } });
+        await tx.trAuditLog.create({ data: { systemActor: 'test-account-seeder', action: 'TEST_ACCOUNT_CREATED', targetType: 'USER', targetId: account.id, reason: 'Explicitly authorized test login fixture; exact .test identity verification bypass only; no operational mandate', details: { email: account.email, role: account.role, emailVerified: true, verificationBasis: 'EXPLICIT_TEST_FIXTURE_BYPASS', fictionalIdentity: true, canConfirmIncidents: false, canPublishInformation: false } } });
       }
     }, { maxWait: 10000, timeout: 60000 });
   } catch {
@@ -70,10 +73,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const { values } = parseArgs({ options: { apply: { type: 'boolean' }, 'confirm-test-accounts': { type: 'boolean' } } });
     if (!values.apply || !values['confirm-test-accounts']) throw new Error('Explicit flags required');
     const file = resolve('.env.test-accounts');
+    const beforeUsers = await db().msUser.findMany({ include: { accounts: true }, orderBy: { id: 'asc' } });
+    const beforeCounts = { users: await db().msUser.count(), accounts: await db().trAccount.count(), reports: await db().trReport.count(), verifications: await db().trVerification.count() };
     const result = await seedTestAccounts(db(), file);
     const verified = await seedTestAccounts(db(), file);
     const auditCount = await db().trAuditLog.count({ where: { systemActor: 'test-account-seeder', action: 'TEST_ACCOUNT_CREATED', targetId: { in: (await db().msUser.findMany({ where, select: { id: true } })).map(user => user.id) } } });
-    console.log(JSON.stringify({ created: result.created, verified: verified.verified, auditCount, credentialsFile: file, identities: testIdentities.map(({ email, role }) => ({ email, role })), canConfirmIncidents: false, canPublishInformation: false }));
+    const preservedUsers = await db().msUser.findMany({ where: { id: { in: beforeUsers.map(user => user.id) } }, include: { accounts: true }, orderBy: { id: 'asc' } });
+    const afterCounts = { users: await db().msUser.count(), accounts: await db().trAccount.count(), reports: await db().trReport.count(), verifications: await db().trVerification.count() };
+    if (!isDeepStrictEqual(beforeUsers, preservedUsers) || afterCounts.users !== beforeCounts.users + result.created || afterCounts.accounts !== beforeCounts.accounts + result.created || afterCounts.reports !== beforeCounts.reports || afterCounts.verifications !== beforeCounts.verifications || auditCount !== 7) throw new Error('Post-seed preservation verification failed');
+    console.log(JSON.stringify({ created: result.created, verified: verified.verified, auditCount, beforeCounts, afterCounts, existingUsersPreserved: true, credentialsFile: file, identities: testIdentities, canConfirmIncidents: false, canPublishInformation: false }));
   } catch { console.error('Test account seed refused or failed; requires --apply --confirm-test-accounts, no identity collisions, and a safe local credentials file. Existing credentials were not reset.'); process.exitCode = 1; }
   finally { await disconnect(); }
 }

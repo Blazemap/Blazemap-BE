@@ -1,1 +1,2 @@
-export { listReports, getReport, createReport, addReportUpdate } from './reports.service.js';
+export { listReports, getReport, createReport, addReportProgress, addReportUpdate } from './reports.service.js';
+export { listCitizenFeed } from './feed.service.js';

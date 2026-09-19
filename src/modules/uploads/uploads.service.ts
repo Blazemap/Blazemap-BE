@@ -4,6 +4,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { fileTypeFromBuffer } from 'file-type';
 import sharp from 'sharp';
 import { db, env, storage } from '../../config/index.js';
+import type { PrismaClient } from '../../generated/prisma/client.js';
 import { uploadSchema, type Actor, type Transaction } from '../../types/index.js';
 import { AppError, unavailable } from '../../utils/index.js';
 import { lockedActor, audit } from '../admin/access.js';
@@ -81,23 +82,29 @@ export async function finalize(actor: Actor, id: string) {
     throw unavailable('Uploads');
   }
 }
-export async function attach(tx: Transaction, actor: Actor, ids: string[], parent: { reportId: string } | { fieldUpdateId: string }) {
+export async function attach(tx: Transaction, actor: Actor, ids: string[], parent: { reportId: string } | { fieldUpdateId: string } | { reportProgressId: string } | { reportProgressId: string; fieldUpdateId: string }) {
   if (!ids.length) return;
   if (new Set(ids).size !== ids.length) throw new AppError('Duplicate attachment', 400, 'INVALID_ATTACHMENT');
-  const count = await tx.trAttachment.updateMany({ where: { id: { in: ids }, uploaderId: actor.id, state: 'READY', expiresAt: { gt: new Date() }, reportId: null, reportUpdateId: null, fieldUpdateId: null, publicationId: null, revokedAt: null }, data: { ...parent, state: 'ATTACHED' } });
+  const count = await tx.trAttachment.updateMany({ where: { id: { in: ids }, uploaderId: actor.id, state: 'READY', expiresAt: { gt: new Date() }, reportId: null, reportUpdateId: null, reportProgressId: null, fieldUpdateId: null, publicationId: null, revokedAt: null }, data: { ...parent, state: 'ATTACHED' } });
   if (count.count !== ids.length) throw new AppError('One or more attachments are unavailable', 400, 'INVALID_ATTACHMENT');
 }
+export async function privateDownloadItem(actor: Actor, id: string, client: PrismaClient = db()) {
+  return client.$transaction(async tx => {
+    const user = await lockedActor(tx, actor);
+    return tx.trAttachment.findFirst({ where: { id, revokedAt: null, state: { in: ['READY', 'ATTACHED'] }, ...(user.role === 'ADMIN' ? {} : { OR: [{ uploaderId: user.id, reportProgressId: null }, { reportProgress: { report: { reporterId: user.id } } }] }) }, select: { objectKey: true, contentType: true } });
+  });
+}
 export async function download(actor: Actor, id: string) {
-  const item = await db().trAttachment.findFirst({ where: { id, revokedAt: null, state: { in: ['READY', 'ATTACHED'] }, ...(actor.role === 'ADMIN' ? {} : { uploaderId: actor.id }) }, select: { objectKey: true, contentType: true } });
+  const item = await privateDownloadItem(actor, id);
   if (!item) throw new AppError('Attachment not found', 404, 'NOT_FOUND');
   try { return { url: await getSignedUrl(storage(), new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: item.objectKey, ResponseContentDisposition: 'attachment', ResponseContentType: item.contentType }), { expiresIn: 60 }) }; }
   catch { throw unavailable('Downloads'); }
 }
 export async function cleanupUploads() {
   await db().trAttachment.updateMany({ where: { state: 'FINALIZING', expiresAt: { lt: new Date(Date.now() - 3600000) } }, data: { state: 'PENDING' } });
-  const candidates = await db().trAttachment.findMany({ where: { state: { in: ['PENDING', 'READY', 'REJECTED', 'DELETING'] }, expiresAt: { lt: new Date() }, reportId: null, reportUpdateId: null, fieldUpdateId: null, publicationId: null }, take: 100, select: { id: true, stagingKey: true, objectKey: true } });
+  const candidates = await db().trAttachment.findMany({ where: { state: { in: ['PENDING', 'READY', 'REJECTED', 'DELETING'] }, expiresAt: { lt: new Date() }, reportId: null, reportUpdateId: null, reportProgressId: null, fieldUpdateId: null, publicationId: null }, take: 100, select: { id: true, stagingKey: true, objectKey: true } });
   for (const item of candidates) {
-    const claim = await db().trAttachment.updateMany({ where: { id: item.id, state: { in: ['PENDING', 'READY', 'REJECTED', 'DELETING'] }, reportId: null, reportUpdateId: null, fieldUpdateId: null, publicationId: null }, data: { state: 'DELETING' } });
+    const claim = await db().trAttachment.updateMany({ where: { id: item.id, state: { in: ['PENDING', 'READY', 'REJECTED', 'DELETING'] }, reportId: null, reportUpdateId: null, reportProgressId: null, fieldUpdateId: null, publicationId: null }, data: { state: 'DELETING' } });
     if (!claim.count) continue;
     for (const key of [item.stagingKey, item.objectKey]) await storage().send(new DeleteObjectCommand({ Bucket: env.S3_BUCKET, Key: key }), { abortSignal: AbortSignal.timeout(15000) });
     await db().trAttachment.delete({ where: { id: item.id, state: 'DELETING' } });

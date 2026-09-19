@@ -106,3 +106,19 @@ publicPerimeter: {
 Later private perimeter/point edits cannot change published geometry. Invalid/legacy snapshots omit publicPerimeter; other modes never expose it. Existing point/withheld behavior and publication withdrawal/expiry filters remain unchanged. Field updates continue through `POST /admin/cases/:id/field-updates`, verification through `POST /admin/cases/:id/verify`.
 
 Offline checks: `node --import tsx triage.check.mjs`, `node --import tsx perimeter.check.mjs`, `node --import tsx reports.check.mjs`, and `node --import tsx integrations.check.mjs`. New checks use mocks only, including authorization, version conflict, audit rollback, snapshot isolation, topology, area, missing-data combinations and constant-query batching.
+
+## BMKG forecast runtime
+
+BMKG synchronization is a one-shot command for a dedicated UTC Railway cron service: `node dist/sync.js BMKG`, scheduled with `0 */6 * * *`. The long-running `dist/watch.js` process polls FIRMS only. `BMKG_POLL_INTERVAL_MS=21600000` is the six-hour freshness guard and should match the cron interval.
+
+A BMKG sync processes only verified administrative level IV regions with stored ADM4 codes and active cases. Cases with coordinates but no selected region remain unmapped; coordinates are never converted to ADM4 without an imported, verified boundary dataset. Operators select a verified mapping through `PATCH /admin/cases/:id/forecast-region`.
+
+## OpenStreetMap spatial ingestion
+
+`npm run sources:osm -- --dry-run` validates the configured official Geofabrik Kalimantan source, MD5 manifest, `Last-Modified` date, and 2 GiB download cap without downloading or writing the dataset. `npm run sources:osm` downloads to a private temporary directory, verifies the MD5 while streaming, performs bounded two-pass PBF extraction, imports batches, and always removes temporary data. `SPATIAL_IMPORT_USER_AGENT` is required and must include operator contact; `OSM_GEOFABRIK_URL` defaults to `https://download.geofabrik.de/asia/indonesia/kalimantan-latest.osm.pbf`.
+
+The import stores only tagged settlement, facility, and water-source nodes plus selected road and river ways. Buildings, forest, peatland, polygons, and relations are not imported. Each layer is capped at 50,000 records, line assembly retains at most 2,000,000 referenced node coordinates, and extracted NDJSON is capped at 1 GiB. Layer metadata uses provider `OpenStreetMap`, license `ODbL 1.0`, attribution `© OpenStreetMap contributors`, the Geofabrik source URL and date, and the MD5 as version. Layers remain unverified and coverage is explicitly incomplete, so nearby settlement points may support positive triage only after operator verification; absence never establishes negative coverage.
+
+For a dedicated Railway cron service, use start command `node dist/spatial-sync.js`, UTC schedule `0 3 * * *`, one replica, and limits no higher than 1 CPU and 1 GB memory. Configure `DATABASE_URL`, `DATABASE_CA_PEM`, and `SPATIAL_IMPORT_USER_AGENT=Blazemap/1.0 (+https://blazemap.my.id)`. Do not enable the schedule until the dry run and offline checks pass; the first full production import is intentionally operator-controlled.
+
+Owner notifications are factual information alerts only. A linked active case can create one idempotent notification per stored forecast and report when the current regional forecast changes wind direction by at least 45 degrees, changes rain context, or crosses explicitly configured `BMKG_NOTIFY_WIND_SPEED_KMH` / `BMKG_NOTIFY_HUMIDITY_PERCENT` thresholds. The threshold variables have no defaults. No first forecast creates a change alert. Notifications are limited to report owners and never imply live sensing, fire confirmation, spread perimeter, arrival time, warning, evacuation or operational instruction.

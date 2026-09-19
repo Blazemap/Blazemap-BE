@@ -5,12 +5,10 @@ import { analyzeSourceCase } from './analysis.service.js';
 import type { PrismaClient } from '../../generated/prisma/client.js';
 
 export { pollIntervals, reevaluationAllowed } from '../../config/index.js';
-export async function pollSources(schedule: { FIRMS: number; BMKG: number }, intervals: { FIRMS: number; BMKG: number }, configured: boolean, run: (source: 'FIRMS' | 'BMKG') => Promise<void>, now = Date.now()) {
-  for (const source of ['FIRMS', 'BMKG'] as const) {
-    if ((source === 'FIRMS' && !configured) || now < schedule[source]) continue;
-    schedule[source] = now + intervals[source];
-    try { await run(source); } catch { continue; }
-  }
+export async function pollSources(schedule: { FIRMS: number }, interval: number, configured: boolean, run: (source: 'FIRMS') => Promise<void>, now = Date.now()) {
+  if (!configured || now < schedule.FIRMS) return;
+  schedule.FIRMS = now + interval;
+  try { await run('FIRMS'); } catch { return; }
 }
 export async function pendingAnalysisRevisions(client: PrismaClient = db()) {
   return client.$queryRaw<{ id: string; contextRevision: number }[]>`
@@ -37,13 +35,13 @@ export async function reanalyzeSourceChanges(signal?: AbortSignal) {
 }
 export async function runSourcesWatch(signal: AbortSignal) {
   const intervals = pollIntervals(env);
-  const schedule = { FIRMS: 0, BMKG: 0 };
+  let nextFirms = 0;
   while (!signal.aborted) {
-    await pollSources(schedule, intervals, firmsConfigured(), async source => {
-      if (signal.aborted) return;
-      try { await syncSource(source, {}); }
-      catch { console.error(`${source} polling unavailable or already coordinated elsewhere`); }
-    });
+    if (firmsConfigured() && Date.now() >= nextFirms) {
+      nextFirms = Date.now() + intervals.FIRMS;
+      try { await syncSource('FIRMS', {}); }
+      catch { console.error('FIRMS polling unavailable or already coordinated elsewhere'); }
+    }
     if (!signal.aborted) {
       try { await reanalyzeSourceChanges(signal); }
       catch { console.error('Case reevaluation queue unavailable'); }

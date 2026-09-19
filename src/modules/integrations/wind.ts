@@ -4,6 +4,11 @@ import { windDirection } from './parsing.js';
 
 const regionSchema = z.object({ id: z.string(), name: z.string(), level: z.literal(4), bmkgAdm4: z.string().regex(/^\d{2}\.\d{2}\.\d{2}\.\d{4}$/), verifiedAt: z.date() });
 const forecastSchema = z.object({ id: z.string(), regionId: z.string(), provider: z.literal('BMKG'), issuedAt: z.date(), validAt: z.date(), fetchedAt: z.date(), windSpeed: z.number().finite().nonnegative().nullable(), windSpeedUnit: z.literal('km/h'), windFromDegrees: z.number().min(0).lt(360).nullable(), windDirectionRaw: z.string().nullable() });
+export const windContextSchema = z.object({
+  status: z.enum(['READY', 'CALM', 'MISSING_WIND', 'STALE', 'NOT_YET_VALID', 'INVALID', 'NO_FORECAST', 'NO_VERIFIED_REGION']), evaluatedAt: z.iso.datetime({ offset: true }), usableUntil: z.iso.datetime({ offset: true }).nullable(),
+  forecast: z.object({ id: z.string(), provider: z.literal('BMKG'), regionId: z.string(), regionName: z.string(), issuedAt: z.iso.datetime({ offset: true }), validAt: z.iso.datetime({ offset: true }), fetchedAt: z.iso.datetime({ offset: true }) }).nullable(),
+  windSpeedKmh: z.number().finite().nonnegative().nullable(), windFromDegrees: z.number().min(0).lt(360).nullable(), windToDegrees: z.number().min(0).lt(360).nullable(), summary: z.string().min(1).max(1000), disclaimer: z.literal('Downwind attention, not predicted perimeter'), spatialExtent: z.null(), settlementExposure: z.literal('UNAVAILABLE'), ruleVersion: z.string().min(1).max(100),
+});
 const labels = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
 export function buildWindContext(regionValue: unknown, forecastValue: unknown, now = new Date()) {
   const region = regionSchema.safeParse(regionValue);

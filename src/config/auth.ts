@@ -1,6 +1,8 @@
 import { betterAuth } from 'better-auth';
 import { prismaAdapter } from 'better-auth/adapters/prisma';
 import { APIError } from 'better-auth/api';
+import { customSession } from 'better-auth/plugins';
+import { effectiveCapabilities } from '../modules/admin/rules.js';
 import nodemailer from 'nodemailer';
 import { db } from './db.js';
 import type { PrismaClient } from '../generated/prisma/client.js';
@@ -42,6 +44,7 @@ export function createAuth(client: PrismaClient = db()) {
     appName: 'Blazemap', secret: env.BETTER_AUTH_SECRET, baseURL: env.BETTER_AUTH_URL, basePath: '/api/auth', trustedOrigins: origins,
     database: prismaAdapter(client, { provider: 'postgresql' }),
     logger: { disabled: true },
+    plugins: [customSession(async ({ user, session }) => ({ user: { ...user, ...effectiveCapabilities(user) }, session }), { user: { additionalFields: privilegeFields } })],
     user: { modelName: 'msUser', additionalFields: privilegeFields, deleteUser: { enabled: false }, validateUserInfo: async ({ user, source }) => {
       if (source.oauth?.providerId === 'google') {
         if (user.emailVerified !== true) return { error: 'email_not_verified' };

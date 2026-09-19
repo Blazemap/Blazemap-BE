@@ -59,6 +59,8 @@ const tx = {
   trAuditLog: { create: async ({ data }) => { if (auditFailure) throw new Error('Audit failed'); audits.push(structuredClone(data)); } },
   trFieldUpdate: { create: async ({ data }) => { const item = { id: 'field', ...data }; fields.push(item); return item; }, findFirst: async () => fields.at(-1) },
   trVerification: { create: async ({ data }) => verifications.push(data) },
+  trReport: { findMany: async () => [] },
+  trReportProgress: { createMany: async () => ({ count: 0 }) },
   trPublicInformation: {
     findUniqueOrThrow: async () => structuredClone(publicationRow),
     update: async ({ data }) => { Object.assign(publicationRow, structuredClone(data)); return structuredClone(publicationRow); },
@@ -69,12 +71,12 @@ const client = { $transaction: async callback => {
   const previous = structuredClone({ c, publicationRow, audits, fields, verifications });
   try { return await callback(tx); } catch (error) { ({ c, publicationRow, audits, fields, verifications } = previous); throw error; }
 } };
-for (const denied of [{ role: 'USER' }, { active: false }, { canConfirmIncidents: false }, { emailVerified: false }]) {
+for (const denied of [{ role: 'USER' }, { active: false }, { emailVerified: false }]) {
   user = { ...actor, ...denied };
   await assert.rejects(updateCase(actor, c.id, patch, client), error => ['FORBIDDEN', 'UNAUTHORIZED'].includes(error.code));
   assert.equal(c.version, 1); assert.equal(audits.length, 0);
 }
-user = { ...actor };
+user = { ...actor, canConfirmIncidents: false, canPublishInformation: false };
 for (const status of ['UNVERIFIED', 'NOT_FIRE']) {
   c.verificationStatus = status;
   await assert.rejects(updateCase(actor, c.id, patch, client), { code: 'INVALID_TRANSITION' });
@@ -92,15 +94,15 @@ assert.equal(audits[0].action, 'CASE_PERIMETER_UPDATED');
 assert.equal(audits[0].details.authorityReference, patch.authorityReference);
 assert.deepEqual(audits[0].details.after.perimeter, polygon);
 assert.equal(publicationRow.status, 'DRAFT'); assert.equal(publicationRow.publicCaseSnapshot, undefined);
-const publishInput = { expectedUpdatedAt: publicationRow.updatedAt.toISOString(), authorityReference: 'Publish authority' };
+const publishInput = { expectedUpdatedAt: publicationRow.updatedAt.toISOString(), authorityReference: 'Publish authority', expectedCaseVersion: c.version };
 await assert.rejects(publishInformation(actor, publicationRow.id, { ...publishInput, expectedUpdatedAt: '2026-09-02T00:00:00Z' }, client), { code: 'PUBLICATION_CONFLICT' });
 for (const change of [{ privacyReview: null }, { caseId: null }]) {
   const old = structuredClone(publicationRow); Object.assign(publicationRow, change);
   await assert.rejects(publishInformation(actor, publicationRow.id, publishInput, client), { code: 'PRIVACY_REVIEW_REQUIRED' }); publicationRow = old;
 }
-user.canPublishInformation = false;
+user.role = 'USER';
 await assert.rejects(publishInformation(actor, publicationRow.id, publishInput, client), { code: 'FORBIDDEN' });
-user.canPublishInformation = true;
+user.role = 'ADMIN';
 c.verificationStatus = 'UNVERIFIED';
 await assert.rejects(publishInformation(actor, publicationRow.id, publishInput, client), { code: 'INVALID_PERIMETER' });
 c.verificationStatus = 'CONFIRMED_FIRE';
@@ -130,7 +132,7 @@ assert.equal(typeof verifyCase, 'function');
 await addFieldUpdate(actor, c.id, { findings: 'VISIBLE_FIRE', description: 'Visible fire confirmed by patrol', source: 'Field patrol', observedAt: patch.perimeterObservedAt, latitude: 0.5, longitude: 110.5 }, client);
 assert.equal(fields.length, 1);
 assert.deepEqual(fields[0].latitude, 0.5);
-await verifyCase(actor, c.id, { version: c.version, outcome: 'CONFIRMED_FIRE', fieldUpdateId: fields[0].id, reason: 'Patrol confirms visible fire', authorityReference: 'Authority 123' }, client);
+await verifyCase(actor, c.id, { version: c.version, outcome: 'CONFIRMED_FIRE', fieldUpdateId: fields[0].id, reason: 'Patrol confirms visible fire', reporterMessage: 'Field inspection confirmed visible fire.', authorityReference: 'Authority 123', perimeter: concave, perimeterObservedAt: patch.perimeterObservedAt, perimeterSource: patch.perimeterSource }, client);
 assert.equal(c.latitude, 0.5); assert.equal(c.longitude, 110.5); assert.equal(verifications.length, 1);
 assert.deepEqual(publicationRow.publicCaseSnapshot, frozen);
 const beforePriority = c.perimeterRevision;
@@ -139,6 +141,6 @@ await updateCase(actor, c.id, { version: c.version, priority: 'HIGH', reason: 'E
 assert.equal(c.priority, 'HIGH'); assert.equal(c.perimeterRevision, beforePriority);
 user.canConfirmIncidents = true;
 fields[0].findings = 'SMOKE_ONLY';
-await assert.rejects(verifyCase(actor, c.id, { version: c.version, outcome: 'CONFIRMED_FIRE', fieldUpdateId: fields[0].id, reason: 'Cannot confirm from smoke', authorityReference: 'Authority 123' }, client), { code: 'INSUFFICIENT_EVIDENCE' });
+await assert.rejects(verifyCase(actor, c.id, { version: c.version, outcome: 'CONFIRMED_FIRE', fieldUpdateId: fields[0].id, reason: 'Cannot confirm from smoke', reporterMessage: 'Inspection did not confirm visible fire.', authorityReference: 'Authority 123', perimeter: concave, perimeterObservedAt: patch.perimeterObservedAt, perimeterSource: patch.perimeterSource }, client), { code: 'INSUFFICIENT_EVIDENCE' });
 assert.equal(verifications.length, 1);
 console.log('Perimeter topology/area, authorization, version locking, audit rollback, publication review, frozen snapshot isolation and unchanged point/field-update flows passed.');

@@ -26,7 +26,7 @@ async function runAnalysis(actor: Actor | null, id: string, expectedRevision?: n
       region: { select: { id: true, name: true, level: true, bmkgAdm4: true, verifiedAt: true } },
       reports: { select: { id: true, observationTypes: true, observedAt: true, locationMode: true, latitude: true, longitude: true, updates: { select: { id: true, kind: true, createdAt: true }, orderBy: { createdAt: 'desc' }, take: 20 } }, take: 100, orderBy: { observedAt: 'desc' } },
       hotspots: { select: { id: true, acquiredAt: true, latitude: true, longitude: true, product: true, confidenceRaw: true, frp: true }, take: 200, orderBy: { acquiredAt: 'desc' } },
-      fieldUpdates: { select: { id: true, findings: true, observedAt: true, latitude: true, longitude: true }, take: 100, orderBy: { observedAt: 'desc' } },
+      fieldUpdates: { select: { id: true, findings: true, source: true, observedAt: true, latitude: true, longitude: true }, take: 100, orderBy: { observedAt: 'desc' } },
     } });
     if (!actor) {
       const attempts = await tx.trAnalysis.count({ where: { caseId: id, contextRevision: c.contextRevision } });

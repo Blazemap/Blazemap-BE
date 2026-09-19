@@ -3,10 +3,14 @@ import { db, databaseAvailable, emailAvailable, uploadsAvailable, env } from '..
 import { googleAvailable } from '../../config/env.js';
 import { AppError } from '../../utils/index.js';
 import type { PrismaClient } from '../../generated/prisma/client.js';
+import type { Actor } from '../../types/index.js';
 import { firmsConfigured } from '../integrations/integrations.service.js';
 import { publicPoint } from '../admin/rules.js';
-import { publicPerimeter } from '../../utils/geometry.js';
+import { reportDto, reportInclude } from '../reports/reports.service.js';
+import { triageReports } from '../reports/triage.js';
+import { polygonSchema, publicPerimeter } from '../../utils/geometry.js';
 import { geometrySchema } from '../admin/datasets.service.js';
+import { windContextSchema } from '../integrations/wind.js';
 
 export function firmsSourceStatus(configured: boolean, latest: string | null, lastSuccess: Date | null, now = Date.now()): { status: 'AVAILABLE' | 'STALE' | 'NOT_CONFIGURED' | 'NOT_SYNCED' | 'UNAVAILABLE'; message?: string; lastSuccessAt?: string } {
   const lastSuccessAt = lastSuccess ? { lastSuccessAt: lastSuccess.toISOString() } : {};
@@ -44,7 +48,7 @@ export async function status() {
 }
 export async function regions(query: unknown) {
   const { search } = z.object({ search: z.string().trim().max(200).optional() }).parse(query);
-  return db().msRegion.findMany({ where: { verifiedAt: { not: null }, ...(search ? { name: { contains: search, mode: 'insensitive' } } : {}) }, select: { id: true, name: true, level: true, code: true, bmkgAdm4: true, timezone: true, parentId: true }, orderBy: { name: 'asc' }, take: 100 });
+  return db().msRegion.findMany({ where: { verifiedAt: { not: null }, ...(search ? { name: { contains: search, mode: 'insensitive' } } : {}) }, select: { id: true, name: true, level: true, code: true, timezone: true, parentId: true }, orderBy: { name: 'asc' }, take: 100 });
 }
 export async function publicMap(query: unknown, client: PrismaClient = db(), configured = firmsConfigured()) {
   const input = z.object({ from: z.iso.datetime({ offset: true }).optional(), to: z.iso.datetime({ offset: true }).optional() }).parse(query);
@@ -56,8 +60,8 @@ export async function publicMap(query: unknown, client: PrismaClient = db(), con
   const sourceStatus = firmsSourceStatus(configured, latest?.status ?? null, last?.completedAt ?? null);
   const hotspots = await client.trHotspot.findMany({ where: { acquiredAt: { gte: from, lte: to } }, select: { id: true, source: true, product: true, satellite: true, instrument: true, latitude: true, longitude: true, acquiredAt: true, confidenceRaw: true, frp: true, version: true, fetchedAt: true }, orderBy: { acquiredAt: 'desc' }, take: 2001 });
   if (hotspots.length > 2000) sourceStatus.message = `${sourceStatus.message ?? ''} Only the latest 2,000 detections are shown; narrow the time range for more detail.`;
-  const publications = await client.trPublicInformation.findMany({ where: { status: 'PUBLISHED', caseId: { not: null }, publishedAt: { gte: from, lte: to }, OR: [{ validUntil: null }, { validUntil: { gt: new Date() } }] }, select: { id: true, slug: true, title: true, publicCaseSnapshot: true, publicLocationMode: true, publicLatitude: true, publicLongitude: true, publishedAt: true, regions: { select: { region: { select: { id: true, name: true } } } } }, orderBy: { publishedAt: 'desc' }, take: 200 });
-  const snapshotSchema = z.object({ id: z.string(), number: z.string(), verificationStatus: z.enum(['UNVERIFIED', 'CONFIRMED_FIRE', 'NOT_FIRE']), handlingStatus: z.enum(['OPEN', 'CHECK_SCHEDULED', 'ON_SCENE', 'RESPONDING', 'MONITORING', 'CLOSED']) });
+  const publications = await client.trPublicInformation.findMany({ where: { status: 'PUBLISHED', caseId: { not: null }, case: { is: { verificationStatus: 'CONFIRMED_FIRE' } }, privacyReview: { not: null }, publicLocationMode: { in: ['APPROVED_INCIDENT_POINT', 'APPROVED_INCIDENT_PERIMETER'] }, publishedAt: { gte: from, lte: to }, AND: [{ OR: [{ validUntil: null }, { validUntil: { gt: new Date() } }] }, { publicCaseSnapshot: { path: ['verificationStatus'], equals: 'CONFIRMED_FIRE' } }] }, select: { id: true, slug: true, title: true, publicCaseSnapshot: true, publicLocationMode: true, publicLatitude: true, publicLongitude: true, publishedAt: true, regions: { select: { region: { select: { id: true, name: true } } } } }, orderBy: { publishedAt: 'desc' } });
+  const snapshotSchema = z.object({ id: z.string(), number: z.string(), verificationStatus: z.enum(['UNVERIFIED', 'CONFIRMED_FIRE', 'NOT_FIRE']), handlingStatus: z.enum(['OPEN', 'CHECK_SCHEDULED', 'ON_SCENE', 'RESPONDING', 'MONITORING', 'CLOSED']), windContext: windContextSchema.optional() });
   const cases = publications.flatMap(p => {
     const value = snapshotSchema.safeParse(p.publicCaseSnapshot);
     if (!value.success) return [];
@@ -71,4 +75,29 @@ export async function publicMap(query: unknown, client: PrismaClient = db(), con
     return [{ id: feature.id, name: feature.name, geometry: geometry.data, areaHectares: attributes.data.areaHectares, generatedAt: attributes.data.generatedAt, demo: true as const }];
   });
   return { demoAreas, hotspots: hotspots.slice(0, 2000).map(h => ({ ...h, frpUnit: 'MW', indicationType: 'THERMAL_ANOMALY', stale: sourceStatus.status !== 'AVAILABLE' })), cases: cases.filter((c, i) => cases.findIndex(other => other.id === c.id) === i), updatedAt: last?.completedAt?.toISOString() ?? null, sourceStatus };
+}
+
+export async function roleMap(actor: Actor, query: unknown, client: PrismaClient = db(), configured = firmsConfigured()) {
+  const publicData = await publicMap(query, client, configured);
+  if (actor.role === 'USER') {
+    const publishedCaseIds = new Set(publicData.cases.map(item => item.id));
+    const reports = await client.trReport.findMany({ where: { reporterId: actor.id }, include: reportInclude, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] });
+    return { ...publicData, ownReports: reports.filter(report => !report.caseId || !publishedCaseIds.has(report.caseId)).map(reportDto) };
+  }
+  const reports = await client.trReport.findMany({ include: reportInclude, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }] });
+  const triage = await triageReports(reports, client);
+  const caseIds = [...new Set(reports.flatMap(report => report.caseId ? [report.caseId] : []))];
+  const rows = caseIds.length ? await client.trCase.findMany({ where: { id: { in: caseIds }, verificationStatus: 'CONFIRMED_FIRE' }, select: { id: true, number: true, title: true, latitude: true, longitude: true, verificationStatus: true, handlingStatus: true, priority: true, priorityReason: true, version: true, openedAt: true, updatedAt: true, perimeter: true, perimeterRevision: true }, orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }] }) : [];
+  const privateCases = rows.flatMap(row => {
+    const perimeter = polygonSchema.safeParse(row.perimeter);
+    return perimeter.success ? [{ ...row, perimeter: perimeter.data }] : [];
+  });
+  const privateCaseIds = new Set(privateCases.map(item => item.id));
+  return {
+    ...publicData,
+    cases: publicData.cases.filter(item => !privateCaseIds.has(item.id)),
+    privateReports: reports.filter(report => !report.caseId || !privateCaseIds.has(report.caseId)).map(report => ({ ...reportDto(report), triage: triage.get(report.id)! })),
+    privateCases,
+    privateLimited: false,
+  };
 }

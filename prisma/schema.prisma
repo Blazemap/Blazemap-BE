@@ -13,9 +13,11 @@ enum Role {
   ADMIN
 }
 enum ReviewStatus {
+  UNDER_REVIEW
   NEW
   NEEDS_DETAILS
   REVIEWED
+  DECLINED
 }
 enum ObservationType {
   SMOKE
@@ -63,6 +65,10 @@ enum PublicationType {
   ANNOUNCEMENT
   WARNING
   EDUCATION
+}
+enum PublicationOutcome {
+  CONFIRMED
+  DECLINED
 }
 enum PublicationStatus {
   DRAFT
@@ -141,6 +147,7 @@ model MsUser {
   accounts TrAccount[]
   reports TrReport[]
   reportUpdates TrReportUpdate[]
+  reportProgress TrReportProgress[]
   fieldUpdates TrFieldUpdate[]
   verifications TrVerification[]
   attachments TrAttachment[] @relation("uploader")
@@ -150,6 +157,7 @@ model MsUser {
   drafts TrPublicInformation[] @relation("author")
   publications TrPublicInformation[] @relation("publisher")
   audits TrAuditLog[]
+  notifications TrNotification[]
 }
 model TrSession {
   id String @id
@@ -211,13 +219,32 @@ model TrReport {
   case TrCase? @relation(fields: [caseId], references: [id], onDelete: Restrict)
   idempotencyKey String
   payloadHash String
+  publications TrPublicInformation[]
   updates TrReportUpdate[]
+  progress TrReportProgress[]
   attachments TrAttachment[]
+  notifications TrNotification[]
   @@unique([reporterId, idempotencyKey])
   @@index([reporterId, createdAt])
   @@index([caseId, observedAt])
   @@index([regionId])
   @@index([reviewStatus, createdAt])
+}
+model TrReportProgress {
+  id String @id @default(cuid())
+  reportId String
+  report TrReport @relation(fields: [reportId], references: [id], onDelete: Restrict)
+  stage String
+  description String
+  idempotencyKey String?
+  payloadHash String?
+  attachments TrAttachment[]
+  actorId String
+  actor MsUser @relation(fields: [actorId], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  @@index([reportId, createdAt])
+  @@index([actorId])
+  @@unique([actorId, idempotencyKey])
 }
 model TrReportUpdate {
   id String @id @default(cuid())
@@ -347,6 +374,8 @@ model TrAttachment {
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   reportId String?
   report TrReport? @relation(fields: [reportId], references: [id], onDelete: Restrict)
+  reportProgressId String?
+  reportProgress TrReportProgress? @relation(fields: [reportProgressId], references: [id], onDelete: Restrict)
   reportUpdateId String?
   reportUpdate TrReportUpdate? @relation(fields: [reportUpdateId], references: [id], onDelete: Restrict)
   fieldUpdateId String?
@@ -365,6 +394,7 @@ model TrAttachment {
   @@index([uploaderId, state])
   @@index([reportId])
   @@index([reportUpdateId])
+  @@index([reportProgressId])
   @@index([fieldUpdateId])
   @@index([publicationId])
   @@index([sourceAttachmentId])
@@ -450,7 +480,11 @@ model MsTeam {
   name String
   organization String?
   active Boolean @default(true)
+  version Int @default(1)
+  idempotencyKey String? @unique
+  payloadHash String?
   createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @default(now()) @updatedAt @db.Timestamptz(3)
   equipment MsEquipment[]
   assignments TrAssignment[]
   updates TrOperationalUpdate[]
@@ -463,7 +497,11 @@ model MsEquipment {
   teamId String?
   team MsTeam? @relation(fields: [teamId], references: [id], onDelete: Restrict)
   active Boolean @default(true)
+  version Int @default(1)
+  idempotencyKey String? @unique
+  payloadHash String?
   createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @default(now()) @updatedAt @db.Timestamptz(3)
   updates TrOperationalUpdate[]
   @@index([teamId])
 }
@@ -477,6 +515,9 @@ model TrAssignment {
   assigningAdmin MsUser @relation(fields: [assigningAdminId], references: [id], onDelete: Restrict)
   status AssignmentStatus @default(ASSIGNED)
   notes String?
+  version Int @default(1)
+  idempotencyKey String? @unique
+  payloadHash String?
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
   @@index([caseId, status])
@@ -498,6 +539,8 @@ model TrOperationalUpdate {
   source String
   observedAt DateTime @db.Timestamptz(3)
   notes String?
+  idempotencyKey String? @unique
+  payloadHash String?
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   @@index([teamId, observedAt])
   @@index([equipmentId, observedAt])
@@ -532,6 +575,9 @@ model TrPublicInformation {
   summary String
   body String
   type PublicationType
+  outcome PublicationOutcome?
+  reportId String?
+  report TrReport? @relation(fields: [reportId], references: [id], onDelete: Restrict)
   status PublicationStatus @default(DRAFT)
   sources Json
   caseId String?
@@ -556,6 +602,7 @@ model TrPublicInformation {
   privacyReview String?
   regions TrPublicInformationRegion[]
   attachments TrAttachment[]
+  @@index([reportId])
   @@index([status, type, publishedAt])
   @@index([caseId])
   @@index([authorId])
@@ -581,6 +628,22 @@ model MsSiteProfile {
   source String?
   verifiedAt DateTime? @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
+}
+model TrNotification {
+  id String @id @default(cuid())
+  userId String
+  user MsUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reportId String
+  report TrReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  eventKey String @unique
+  type String
+  title String
+  message String
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  readAt DateTime? @db.Timestamptz(3)
+  @@index([userId, createdAt, id])
+  @@index([userId, readAt])
+  @@index([reportId])
 }
 model TrIntegrationRun {
   id String @id @default(cuid())

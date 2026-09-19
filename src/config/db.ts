@@ -3,7 +3,14 @@ import { PrismaClient } from '../generated/prisma/client.js';
 import { env } from './env.js';
 import { unavailable } from '../utils/index.js';
 
-const client = env.DATABASE_URL ? new PrismaClient({ adapter: new PrismaPg({ connectionString: env.DATABASE_URL, max: 10, connectionTimeoutMillis: 5000, idleTimeoutMillis: 300000, statement_timeout: 10000, query_timeout: 12000 }), log: [] }) : null;
+export function databaseConnectionConfig(connectionString: string, ca: string | undefined) {
+  if (!ca) return { connectionString };
+  const url = new URL(connectionString);
+  url.searchParams.delete('sslrootcert');
+  url.searchParams.delete('sslmode');
+  return { connectionString: url.toString(), ssl: { ca, rejectUnauthorized: true } };
+}
+const client = env.DATABASE_URL ? new PrismaClient({ adapter: new PrismaPg({ ...databaseConnectionConfig(env.DATABASE_URL, env.DATABASE_CA_PEM), max: 10, connectionTimeoutMillis: 5000, idleTimeoutMillis: 300000, statement_timeout: 10000, query_timeout: 12000 }), log: [] }) : null;
 export function db() { if (!client) throw unavailable('Database'); return client; }
 let lastFailureLog = 0;
 let readiness: Promise<boolean> | undefined;

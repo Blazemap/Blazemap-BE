@@ -7,10 +7,11 @@ import { geometryDistanceMeters, prepareGeometryDistance, type Position } from '
 const ruleVersion = 'report-triage-1';
 const bboxSchema = z.tuple([z.number().min(-180).max(180), z.number().min(-90).max(90), z.number().min(-180).max(180), z.number().min(-90).max(90)]).refine(([w, s, e, n]) => w < e && s < n);
 const coverageSchema = z.object({ bbox: bboxSchema, validFrom: z.iso.datetime({ offset: true }), validTo: z.iso.datetime({ offset: true }), complete: z.literal(true) });
-const scopeSchema = z.object({ area: z.string(), products: z.array(z.string()).min(1), observedFrom: z.iso.datetime({ offset: true }), observedTo: z.iso.datetime({ offset: true }) });
-type Report = Pick<TrReport, 'id' | 'number' | 'locationMode' | 'latitude' | 'longitude' | 'observedAt'> & Partial<Pick<TrReport, 'description' | 'locationDescription'>>;
+const scopeSchema = z.object({ area: z.string().optional(), areas: z.array(z.string()).min(1).max(16).optional(), products: z.array(z.string()).min(1), observedFrom: z.iso.datetime({ offset: true }), observedTo: z.iso.datetime({ offset: true }) }).refine(scope => !!scope.area || !!scope.areas?.length);
+type Report = Pick<TrReport, 'id' | 'number' | 'locationMode' | 'latitude' | 'longitude' | 'observedAt'> & Partial<Pick<TrReport, 'description' | 'locationDescription' | 'idempotencyKey'>>;
 export type Triage = { level: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'UNKNOWN'; reasonCodes: string[]; missingData: string[]; evaluatedAt: string; ruleVersion: string; satelliteMatch: { distanceMeters: number; acquiredAt: string } | null; settlementMatch: { name: string | null; distanceMeters: number } | null };
 export type TriagePolicy = { TRIAGE_HOTSPOT_RADIUS_METERS?: string; TRIAGE_HOTSPOT_WINDOW_HOURS?: string; TRIAGE_SETTLEMENT_RADIUS_METERS?: string };
+const sample = (value: unknown) => typeof value === 'string' && value.startsWith('sample-v2-');
 const demo = (...values: unknown[]) => values.some(value => /demo|simulated|synthetic/i.test(typeof value === 'string' ? value : JSON.stringify(value) ?? ''));
 function incidentPoint(report: Report): Position | null {
   const { latitude, longitude } = report;
@@ -35,6 +36,7 @@ export async function triageReports(reports: Report[], client: PrismaClient, pol
     const value: Triage = { level: 'UNKNOWN', reasonCodes: [], missingData: [...missingPolicy], evaluatedAt: now.toISOString(), ruleVersion, satelliteMatch: null, settlementMatch: null };
     results.set(report.id, value);
     if (missingPolicy.length) value.reasonCodes.push('POLICY_NOT_CONFIGURED');
+    if (sample(report.idempotencyKey)) { value.reasonCodes.push('SAMPLE_EXCLUDED'); return false; }
     if (demo(report.number, report.description, report.locationDescription)) { value.reasonCodes.push('DEMO_EXCLUDED'); return false; }
     if (!incidentPoint(report)) { value.reasonCodes.push('INCIDENT_LOCATION_UNKNOWN'); value.missingData.push('INCIDENT_COORDINATES'); return false; }
     if (missingPolicy.length) return false;
@@ -54,7 +56,7 @@ export async function triageReports(reports: Report[], client: PrismaClient, pol
   const layerIds = new Set(usableLayers.map(layer => layer.id));
   const preparedSettlements = settlements.slice(0, 10000).filter(settlement => layerIds.has(settlement.layerId) && !demo(settlement.name, settlement.attributes)).map(settlement => ({ layerId: settlement.layerId, name: settlement.name, distance: prepareGeometryDistance(settlement.geometry) }));
   const sourceScope = scopeSchema.safeParse(latest?.scope);
-  const sourceBox = sourceScope.success ? bboxSchema.safeParse(sourceScope.data.area.split(',').map(Number)) : null;
+  const sourceBoxes = sourceScope.success ? (sourceScope.data.areas ?? [sourceScope.data.area!]).map(area => bboxSchema.safeParse(area.split(',').map(Number))) : [];
   for (const report of eligible) {
     const value = results.get(report.id)!;
     const point = incidentPoint(report)!;
@@ -72,7 +74,7 @@ export async function triageReports(reports: Report[], client: PrismaClient, pol
       if (distance === null) { invalidSettlement = true; continue; }
       if (distance <= settlementRadius && (!value.settlementMatch || distance < value.settlementMatch.distanceMeters)) value.settlementMatch = { name: settlement.name, distanceMeters: distance };
     }
-    const sourceCovered = sourceConfigured && latest?.status === 'SUCCEEDED' && latest.completedAt && latest.completedAt <= now && now.getTime() - latest.completedAt.getTime() <= 3600000 && sourceScope.success && sourceBox?.success && !demo(sourceScope.data.products) && Date.parse(sourceScope.data.observedFrom) <= time - windowMs && Date.parse(sourceScope.data.observedTo) >= time + windowMs && Date.parse(sourceScope.data.observedTo) <= latest.completedAt.getTime() && covers(sourceBox.data, point, radius);
+    const sourceCovered = sourceConfigured && latest?.status === 'SUCCEEDED' && latest.completedAt && latest.completedAt <= now && now.getTime() - latest.completedAt.getTime() <= 3600000 && sourceScope.success && sourceBoxes.some(box => box.success && covers(box.data, point, radius)) && !demo(sourceScope.data.products) && Date.parse(sourceScope.data.observedFrom) <= time - windowMs && Date.parse(sourceScope.data.observedTo) >= time + windowMs && Date.parse(sourceScope.data.observedTo) <= latest.completedAt.getTime();
     const settlementCovered = usableLayers.some(layer => {
       let coverage: unknown;
       try { coverage = JSON.parse(layer.coverage); } catch { return false; }

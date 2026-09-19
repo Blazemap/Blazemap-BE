@@ -9,6 +9,7 @@ const dir = await mkdtemp(join(tmpdir(), 'blazemap-account-check-'));
 let users = [], audits = [], transactions = 0;
 const client = {
   msUser: { findMany: async () => users },
+  trAuditLog: { findMany: async () => audits },
   $transaction: async callback => {
     transactions++;
     const pending = [], events = [];
@@ -34,7 +35,11 @@ try {
   const original = await readFile(file, 'utf8');
   const credentials = JSON.parse(original);
   assert.equal(new Set(credentials.accounts.map(account => account.password)).size, 7);
-  assert.ok(credentials.accounts.every(account => account.password.length >= 20));
+  assert.ok(credentials.accounts.every(account => account.password.length >= 24));
+  assert.equal(new Set(testIdentities.map(identity => identity.name)).size, 7);
+  assert.ok(testIdentities.every(identity => !/test|demo|fixture/i.test(identity.name) && identity.email.endsWith('@blazemap.test')));
+  assert.deepEqual(testIdentities.map(identity => identity.email), ['govt@blazemap.test', 'user@blazemap.test', ...Array.from({ length: 5 }, (_, index) => `reporter0${index + 1}@blazemap.test`)]);
+  assert.ok(audits.every(event => event.details.fictionalIdentity && event.details.verificationBasis === 'EXPLICIT_TEST_FIXTURE_BYPASS'));
   assert.equal((await seedTestAccounts(client, file)).verified, 7);
   assert.equal(transactions, 1);
   assert.equal(await readFile(file, 'utf8'), original);
@@ -51,6 +56,15 @@ try {
   await assert.rejects(seedTestAccounts(client, join(dir, 'collision')));
   assert.equal(transactions, 1);
   users = saved;
+  const savedAudits = audits;
+  audits = [];
+  await assert.rejects(seedTestAccounts(client, file), /audit provenance/);
+  audits = [...savedAudits, savedAudits[0]];
+  await assert.rejects(seedTestAccounts(client, file), /audit provenance/);
+  audits = savedAudits;
+  users[0].canConfirmIncidents = true;
+  await assert.rejects(seedTestAccounts(client, file));
+  users[0].canConfirmIncidents = false;
   users[0].accounts[0].password = await hashPassword('different-password-not-a-reset');
   await assert.rejects(seedTestAccounts(client, file));
   users = [];

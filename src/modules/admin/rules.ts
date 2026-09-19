@@ -1,8 +1,12 @@
 import { AppError } from '../../utils/index.js';
 import type { HandlingStatus, VerificationStatus } from '../../generated/prisma/enums.js';
 
-export function authorize(user: { role: string; active: boolean; canConfirmIncidents?: boolean; canPublishInformation?: boolean } | null, capability?: 'canConfirmIncidents' | 'canPublishInformation') {
-  if (!user?.active || user.role !== 'ADMIN' || (capability && !user[capability])) throw new AppError('Not authorized for this action', 403, 'FORBIDDEN');
+export function effectiveCapabilities(user: { role?: string | null; active?: boolean | null; emailVerified?: boolean }) {
+  const authorized = user.role === 'ADMIN' && user.active === true && user.emailVerified === true;
+  return { canConfirmIncidents: authorized, canPublishInformation: authorized };
+}
+export function authorize(user: { role: string; active: boolean; emailVerified?: boolean; canConfirmIncidents?: boolean; canPublishInformation?: boolean } | null, capability?: 'canConfirmIncidents' | 'canPublishInformation') {
+  if (!user || !effectiveCapabilities(user)[capability ?? 'canConfirmIncidents']) throw new AppError('Not authorized for this action', 403, 'FORBIDDEN');
 }
 export function nextPublicationTimestamp(previous: Date, now = Date.now()) {
   return new Date(Math.max(now, previous.getTime() + 1));

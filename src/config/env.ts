@@ -2,15 +2,20 @@ import 'dotenv/config';
 import { z } from 'zod';
 
 const optional = z.preprocess(v => v === '' ? undefined : v, z.string().optional());
+const optionalNumber = (minimum: number, maximum: number) => z.preprocess(v => v === '' || v === undefined ? undefined : v, z.coerce.number().finite().min(minimum).max(maximum).optional());
 const oauthCredential = (schema: z.ZodString) => z.preprocess(v => typeof v === 'string' && !v.trim() ? undefined : v, schema.optional());
 const raw = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
-  DATABASE_URL: optional, BETTER_AUTH_SECRET: optional, BETTER_AUTH_URL: optional, FRONTEND_URL: optional,
+  DATABASE_URL: optional, DATABASE_CA_PEM: optional, BETTER_AUTH_SECRET: optional, BETTER_AUTH_URL: optional, FRONTEND_URL: optional,
   GOOGLE_CLIENT_ID: oauthCredential(z.string().max(256).regex(/^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/)),
   GOOGLE_CLIENT_SECRET: oauthCredential(z.string().min(1).max(512).regex(/^[A-Za-z0-9_-]+$/)),
-  AI_SERVICE_URL: optional, AI_SERVICE_TOKEN: optional, AI_AUTO_REANALYZE: optional, FIRMS_MAP_KEY: optional, FIRMS_PRODUCTS: optional, FIRMS_AREA: optional, FIRMS_POLL_INTERVAL_MS: optional, BMKG_POLL_INTERVAL_MS: optional,
+  AI_SERVICE_URL: optional, AI_SERVICE_TOKEN: optional, AI_AUTO_REANALYZE: optional,
+  AI_COORDINATE_PRECISION_DECIMALS: z.preprocess(v => v === '' || v === undefined ? undefined : v, z.coerce.number().int().min(0).max(4).default(2)),
+  FIRMS_MAP_KEY: optional, FIRMS_PRODUCTS: optional, FIRMS_AREA: optional, FIRMS_POLL_INTERVAL_MS: optional, BMKG_POLL_INTERVAL_MS: optional,
+  SPATIAL_IMPORT_USER_AGENT: optional, OSM_GEOFABRIK_URL: optional,
+  BMKG_NOTIFY_WIND_SPEED_KMH: optionalNumber(0, 1000), BMKG_NOTIFY_HUMIDITY_PERCENT: optionalNumber(0, 100),
   TRIAGE_HOTSPOT_RADIUS_METERS: optional, TRIAGE_HOTSPOT_WINDOW_HOURS: optional, TRIAGE_SETTLEMENT_RADIUS_METERS: optional,
   S3_ENDPOINT: optional, S3_REGION: optional, S3_BUCKET: optional, S3_ACCESS_KEY_ID: optional, S3_SECRET_ACCESS_KEY: optional, S3_FORCE_PATH_STYLE: optional,
   SMTP_HOST: optional, SMTP_PORT: optional, SMTP_SECURE: optional, SMTP_USER: optional, SMTP_PASSWORD: optional, SMTP_FROM: optional,

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { db } from '../../config/index.js';
+import type { PrismaClient } from '../../generated/prisma/client.js';
 import { featureKinds, idSchema, latitudeSchema, longitudeSchema, paginationSchema, reasonSchema, timeSchema, type Actor } from '../../types/index.js';
 import { AppError, jsonValue } from '../../utils/index.js';
 import { audit, bumpContext, lockedActor, verifiedRegion } from './access.js';
@@ -45,6 +46,16 @@ export async function importLayer(actor: Actor, body: unknown) {
 }
 export async function listLayers() {
   return db().msMapLayer.findMany({ select: { id: true, name: true, kind: true, provider: true, sourceUrl: true, license: true, attribution: true, coverage: true, version: true, sourceDate: true, importedAt: true, verifiedAt: true, _count: { select: { features: true } } }, take: 100, orderBy: { importedAt: 'desc' } });
+}
+export async function listRegions(query: unknown, client: PrismaClient = db()) {
+  const { search, bmkgMapped } = z.strictObject({ search: z.string().trim().max(200).optional(), bmkgMapped: z.enum(['true', 'false']).optional() }).parse(query);
+  const rows = await client.msRegion.findMany({
+    where: { verifiedAt: { not: null }, ...(bmkgMapped === 'true' ? { bmkgAdm4: { not: null }, level: 4 } : bmkgMapped === 'false' ? { bmkgAdm4: null } : {}), ...(search ? { name: { contains: search, mode: 'insensitive' as const } } : {}) },
+    select: { id: true, name: true, code: true, level: true, timezone: true, bmkgAdm4: true },
+    orderBy: { name: 'asc' },
+    take: 100,
+  });
+  return rows.map(({ bmkgAdm4, ...region }) => ({ ...region, bmkgMapped: bmkgAdm4 !== null }));
 }
 export async function listFeatures(query: unknown) {
   const { page, pageSize, regionId, search } = paginationSchema.parse(query);
