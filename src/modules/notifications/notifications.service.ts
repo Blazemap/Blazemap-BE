@@ -5,7 +5,7 @@ import type { Actor, Transaction } from '../../types/index.js';
 import { AppError } from '../../utils/index.js';
 
 const querySchema = z.object({ cursor: z.string().trim().min(1).max(128).optional(), pageSize: z.coerce.number().int().min(1).max(10).default(10) });
-const notificationSelect = { id: true, reportId: true, type: true, title: true, message: true, createdAt: true, readAt: true } as const;
+const notificationSelect = { id: true, reportId: true, publicationId: true, caseId: true, publication: { select: { slug: true } }, type: true, title: true, message: true, createdAt: true, readAt: true } as const;
 
 function notificationTitle(stage: string) {
   const titles: Record<string, string> = {
@@ -32,6 +32,15 @@ export async function createReportNotification(tx: Transaction, input: { eventKe
     data: [{ userId, reportId: input.reportId, eventKey: input.eventKey, type: input.type, title: notificationTitle(input.stage), message: input.message }],
     skipDuplicates: true,
   });
+}
+
+export function adminNotificationRows(adminIds: string[], input: { eventKey: string; reportId: string; type: string; title: string; message: string }) {
+  return adminIds.map(userId => ({ userId, reportId: input.reportId, eventKey: `${input.eventKey}:${userId}`, type: input.type, title: input.title, message: input.message }));
+}
+export async function createAdminNotifications(tx: Transaction, input: { eventKey: string; reportId: string; type: string; title: string; message: string }) {
+  const admins = await tx.msUser.findMany({ where: { role: 'ADMIN', active: true, emailVerified: true }, select: { id: true } });
+  if (!admins.length) return { count: 0 };
+  return tx.trNotification.createMany({ data: adminNotificationRows(admins.map(admin => admin.id), input), skipDuplicates: true });
 }
 
 export async function listNotifications(actor: Actor, query: unknown, client: PrismaClient = db()) {

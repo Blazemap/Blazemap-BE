@@ -2,4 +2,5 @@ export { env, origins, emailAvailable, uploadsAvailable, pollIntervals, reevalua
 export { db, databaseAvailable, disconnect } from './db.js';
 export { auth, createAuth, privilegeFields } from './auth.js';
 export { storage } from './storage.js';
+export { sendEmail } from './email.js';
 export { openapi, swaggerRouter } from './swagger.js';

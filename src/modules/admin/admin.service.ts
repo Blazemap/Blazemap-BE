@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { PrismaClient } from '../../generated/prisma/client.js';
 import { db } from '../../config/index.js';
-import { caseSchema, casePatchSchema, caseRegionSchema, fieldSchema, verificationSchema, reviewSchema, reportActionSchema, paginationSchema, assignmentSchema, assignmentPatchSchema, teamSchema, teamPatchSchema, equipmentSchema, equipmentPatchSchema, operationalSchema, adminUserPatchSchema, handlingStatuses, verificationStatuses, priorities, reviewerAssessmentSource, type Actor, type Transaction } from '../../types/index.js';
+import { caseSchema, casePatchSchema, fieldSchema, verificationSchema, reviewSchema, reportActionSchema, paginationSchema, assignmentSchema, assignmentPatchSchema, teamSchema, teamPatchSchema, equipmentSchema, equipmentPatchSchema, operationalSchema, operationalFeatureSchema, adminUserPatchSchema, handlingStatuses, verificationStatuses, priorities, reviewerAssessmentSource, type Actor, type Transaction } from '../../types/index.js';
 import { AppError, fingerprint, jsonValue } from '../../utils/index.js';
 import { areaHectares, polygonSchema } from '../../utils/geometry.js';
 import { attach } from '../uploads/uploads.service.js';
@@ -12,14 +12,16 @@ import { citationSources } from '../integrations/citations.js';
 import { progressSelect, reportDto, reportInclude } from '../reports/reports.service.js';
 import { recordCaseProgress } from '../reports/progress.js';
 import { createReportNotification } from '../notifications/index.js';
+import { evaluateNearby, lockNearbyWorkflow } from '../notifications/nearby.service.js';
 import { activeAssignments, audit, bumpContext, lockedActor, verifiedRegion } from './access.js';
-import { assertVersion, effectiveCapabilities, transition, verificationProjection } from './rules.js';
+import { assertCaseOpen, assertVersion, effectiveCapabilities, transition, verificationProjection } from './rules.js';
+import { applicationAdminAuthority, isAssignedConfirmationEvidence, normalizeVerification, recordConfirmedCase } from './confirmation.service.js';
 
-export const caseSelect = { id: true, number: true, title: true, latitude: true, longitude: true, regionId: true, verificationStatus: true, handlingStatus: true, priority: true, priorityReason: true, version: true, contextRevision: true, latestAnalysisId: true, openedAt: true, updatedAt: true, closedAt: true, closureReason: true } as const;
+export const caseSelect = { id: true, number: true, title: true, latitude: true, longitude: true, regionId: true, verificationStatus: true, handlingStatus: true, priority: true, priorityReason: true, version: true, contextRevision: true, latestAnalysisId: true, openedAt: true, updatedAt: true, closedAt: true, closureReason: true, completionFieldUpdateId: true } as const;
 export async function listCases(query: unknown) {
   const { page, pageSize, search, handlingStatus, verificationStatus, priority, regionId } = paginationSchema.extend({ handlingStatus: z.enum(handlingStatuses).optional(), verificationStatus: z.enum(verificationStatuses).optional(), priority: z.enum(priorities).optional() }).parse(query);
-  const where = { handlingStatus, verificationStatus, priority, regionId, ...(search ? { OR: [{ title: { contains: search, mode: 'insensitive' as const } }, { number: { contains: search } }] } : {}) };
-  const [rows, total] = await db().$transaction([db().trCase.findMany({ where, select: { ...caseSelect, perimeter: true, perimeterRevision: true }, orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }], skip: (page - 1) * pageSize, take: pageSize }), db().trCase.count({ where })]);
+  const where = { handlingStatus: handlingStatus ?? { not: 'CLOSED' as const }, verificationStatus, priority, regionId, ...(search ? { OR: [{ title: { contains: search, mode: 'insensitive' as const } }, { number: { contains: search } }] } : {}) };
+  const [rows, total] = await db().$transaction([db().trCase.findMany({ where, select: { ...caseSelect, perimeter: true, perimeterRevision: true }, orderBy: [{ priority: 'asc' }, { updatedAt: 'desc' }, { id: 'desc' }], skip: (page - 1) * pageSize, take: pageSize }), db().trCase.count({ where })]);
   const data = rows.map(row => {
     const perimeter = row.verificationStatus === 'CONFIRMED_FIRE' ? polygonSchema.safeParse(row.perimeter) : null;
     return { ...row, perimeter: perimeter?.success ? perimeter.data : null };
@@ -27,14 +29,14 @@ export async function listCases(query: unknown) {
   return { data, meta: { total, page, pageSize } };
 }
 export async function getCase(id: string, actor?: Actor) {
-  const c = await db().trCase.findUnique({ where: { id }, select: { ...caseSelect, bmkgAdm4Reference: true, weatherReference: true, perimeter: true, perimeterObservedAt: true, perimeterSource: true, perimeterRevision: true,
-    region: { select: { id: true, name: true, timezone: true, level: true, bmkgAdm4: true, verifiedAt: true } },
+  const c = await db().trCase.findUnique({ where: { id }, select: { ...caseSelect, perimeter: true, perimeterObservedAt: true, perimeterSource: true, perimeterRevision: true,
+    region: { select: { id: true, name: true, timezone: true, level: true, verifiedAt: true } },
     reports: { include: reportInclude, orderBy: { observedAt: 'desc' }, take: 100 },
-    hotspots: { select: { id: true, source: true, product: true, latitude: true, longitude: true, acquiredAt: true, confidenceRaw: true, frp: true, satellite: true, instrument: true, version: true, fetchedAt: true }, take: 300, orderBy: { acquiredAt: 'desc' } },
-    fieldUpdates: { select: { id: true, findings: true, description: true, source: true, teamId: true, observedAt: true, createdAt: true, latitude: true, longitude: true, attachments: { select: { id: true, filename: true, contentType: true, size: true } } }, take: 100, orderBy: { observedAt: 'desc' } },
+    fieldUpdates: { select: { id: true, findings: true, description: true, source: true, provenance: true, sourceReportId: true, teamId: true, assignmentId: true, assignment: { select: { id: true, status: true, team: { select: { id: true, name: true } } } }, observedAt: true, createdAt: true, latitude: true, longitude: true, attachments: { select: { id: true, filename: true, contentType: true, size: true } } }, take: 100, orderBy: { observedAt: 'desc' } },
     verifications: { select: { id: true, outcome: true, previousStatus: true, newStatus: true, reason: true, authorityReference: true, fieldUpdateId: true, correctedDecisionId: true, createdAt: true }, take: 100, orderBy: { createdAt: 'desc' } },
     analyses: { select: { id: true, input: true, contextRevision: true, status: true, output: true, evidenceLevel: true, impactLevel: true, suggestedPriority: true, model: true, schemaVersion: true, promptVersion: true, ruleVersion: true, failureCode: true, startedAt: true, completedAt: true }, take: 20, orderBy: { startedAt: 'desc' } },
-    assignments: { select: { id: true, caseId: true, teamId: true, status: true, notes: true, createdAt: true, updatedAt: true, team: { select: { id: true, name: true } } }, take: 100, orderBy: { createdAt: 'desc' } },
+    assignments: { select: { id: true, caseId: true, teamId: true, status: true, notes: true, acceptedAt: true, startedAt: true, completedAt: true, cancelledAt: true, createdAt: true, updatedAt: true, team: { select: { id: true, name: true } } }, take: 100, orderBy: { createdAt: 'desc' } },
+    publications: { where: { type: 'UPDATE', outcome: null, status: { in: ['DRAFT', 'PUBLISHED'] }, caseDraftKey: null }, select: { id: true, slug: true, title: true, summary: true, body: true, bodyRich: true, updatedAt: true, publishedAt: true, validUntil: true, status: true, sources: true, publicLocationMode: true, privacyReview: true, supersedesId: true, regions: { select: { region: { select: { id: true, name: true, timezone: true } } } } }, take: 1, orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }] },
   } });
   if (!c) throw new AppError('Case not found', 404, 'NOT_FOUND');
   const timeline = await db().trAuditLog.findMany({ where: { targetType: 'CASE', targetId: id }, select: { id: true, action: true, reason: true, details: true, createdAt: true, actor: { select: { name: true } } }, orderBy: { createdAt: 'desc' }, take: 200 });
@@ -47,15 +49,18 @@ export async function getCase(id: string, actor?: Actor) {
     if (typeof from !== 'string' || typeof to !== 'string' || !priorities.includes(from as typeof priorities[number]) || !priorities.includes(to as typeof priorities[number]) || from === to) return [];
     return [{ id: entry.id, from, to, reason: entry.reason, changedAt: entry.createdAt, changedBy: entry.actor?.name ?? 'Government administrator' }];
   });
-  const { forecast, windContext } = await loadWindContext(db(), c.region);
-  const weather = forecast && windContext.forecast ? [{ ...windContext.forecast, temperature: forecast.temperature, humidity: forecast.humidity, windSpeed: windContext.windSpeedKmh, windSpeedUnit: 'km/h', windFromDegrees: windContext.windFromDegrees, windToDegrees: windContext.windToDegrees, directionPrecision: 'CARDINAL', measurementType: 'FORECAST', stale: !['READY', 'CALM', 'MISSING_WIND'].includes(windContext.status) }] : [];
+  const { forecast, windContext, weather: weatherResolution } = await loadWindContext(db(), c, new Date());
+  const weather = forecast && windContext.forecast ? [{ ...windContext.forecast, temperature: forecast.temperature, humidity: forecast.humidity, windSpeed: windContext.windSpeedKmh, windSpeedUnit: 'km/h', windFromDegrees: windContext.windFromDegrees, windToDegrees: windContext.windToDegrees, directionPrecision: 'DEGREES', measurementType: 'CURRENT_CONDITIONS', attribution: forecast.attribution, stale: windContext.stale }] : [];
   const spatialContext = c.regionId ? await db().msMapFeature.findMany({ where: { regionId: c.regionId, layer: { verifiedAt: { not: null } } }, select: { id: true, name: true, kind: true, layerId: true, geometry: true, attributes: true, layer: { select: { provider: true, license: true, attribution: true, sourceDate: true, importedAt: true, verifiedAt: true, version: true } } }, take: 100 }) : [];
   const conditions = spatialContext.length ? await db().trOperationalUpdate.findMany({ where: { featureId: { in: spatialContext.map(f => f.id) }, observedAt: { lte: new Date() } }, distinct: ['featureId'], orderBy: [{ featureId: 'asc' }, { observedAt: 'desc' }], select: { id: true, featureId: true, condition: true, source: true, observedAt: true }, take: 100 }) : [];
   const exposure = buildExposure(c, spatialContext, conditions, windContext);
   const perimeter = polygonSchema.safeParse(c.perimeter);
   const currentActor = actor ? await db().msUser.findUnique({ where: { id: actor.id }, select: { role: true, active: true, emailVerified: true } }) : null;
   const activeAssignmentCount = await db().trAssignment.count({ where: { caseId: id, status: { in: [...activeAssignments] } } });
-  return { ...c, analyses: c.analyses.map(({ input, ...analysis }) => ({ ...analysis, sources: citationSources(input) })), operatorAuthorityConfigured: !!currentActor && effectiveCapabilities(currentActor).canConfirmIncidents, activeAssignmentCount, areaHectares: perimeter.success ? areaHectares(perimeter.data) : null, reports: c.reports.map(reportDto), priorityHistory, timeline: timeline.map(({ actor: _actor, ...entry }) => entry), weather, windContext, spatialContext, exposure };
+  const { publications, ...caseDetail } = c;
+  const publication = publications[0];
+  const activePublication = publication ? (() => { const { privacyReview, regions, ...value } = publication; return { ...value, privacyReviewed: !!privacyReview?.trim(), regions: regions.map(item => item.region) }; })() : null;
+  return { ...caseDetail, activePublication, analyses: c.analyses.map(({ input, ...analysis }) => ({ ...analysis, sources: citationSources(input) })), operatorAuthorityConfigured: !!currentActor && effectiveCapabilities(currentActor).canConfirmIncidents, activeAssignmentCount, areaHectares: perimeter.success ? areaHectares(perimeter.data) : null, reports: c.reports.map(reportDto), priorityHistory, timeline: timeline.map(({ actor: _actor, ...entry }) => entry), weather, weatherResolution, windContext, spatialContext, exposure };
 }
 export async function createCase(actor: Actor, body: unknown) {
   const { reason, ...data } = caseSchema.parse(body);
@@ -70,6 +75,7 @@ export async function createCase(actor: Actor, body: unknown) {
 export async function updateCase(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
   const input = casePatchSchema.parse(body);
   return client.$transaction(async tx => {
+    await lockNearbyWorkflow(tx);
     const user = await lockedActor(tx, actor, true, 'perimeter' in input ? 'canConfirmIncidents' : undefined);
     if ('perimeter' in input) {
       const verified = await tx.msUser.findUnique({ where: { id: user.id }, select: { emailVerified: true } });
@@ -78,40 +84,46 @@ export async function updateCase(actor: Actor, id: string, body: unknown, client
     await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${id} FOR UPDATE`;
     const c = await tx.trCase.findUniqueOrThrow({ where: { id } });
     assertVersion(c.version, input.version);
+    assertCaseOpen(c);
     if ('perimeter' in input) {
       if (c.verificationStatus !== 'CONFIRMED_FIRE') throw new AppError('Perimeter requires a confirmed fire', 409, 'INVALID_TRANSITION');
       const data = await tx.trCase.update({ where: { id, version: input.version }, data: { perimeter: jsonValue(input.perimeter), perimeterObservedAt: new Date(input.perimeterObservedAt), perimeterSource: input.perimeterSource, perimeterRevision: { increment: 1 }, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null }, select: { ...caseSelect, perimeter: true, perimeterObservedAt: true, perimeterSource: true, perimeterRevision: true } });
       await audit(tx, actor.id, 'CASE_PERIMETER_UPDATED', 'CASE', id, input.reason, { authorityReference: input.authorityReference, authorityBasis: 'APPLICATION_ADMIN_ROLE', authorityNoteSource: 'OPERATOR_SUPPLIED', before: { perimeter: c.perimeter, observedAt: c.perimeterObservedAt, source: c.perimeterSource, revision: c.perimeterRevision }, after: { perimeter: data.perimeter, observedAt: data.perimeterObservedAt, source: data.perimeterSource, revision: data.perimeterRevision }, areaHectares: areaHectares(input.perimeter) });
+      await recordCaseProgress(tx, id, actor.id, 'CASE_REVISION', input.reporterMessage);
       return { ...data, areaHectares: areaHectares(input.perimeter) };
     }
     const handling = input.handlingStatus ?? c.handlingStatus;
     const count = await tx.trAssignment.count({ where: { caseId: id, status: { in: [...activeAssignments] } } });
     transition(c.verificationStatus, handling, count);
-    const data = await tx.trCase.update({ where: { id, version: input.version }, data: { priority: input.priority, priorityReason: input.priority ? input.reason : undefined, handlingStatus: handling, closedAt: handling === 'CLOSED' ? c.closedAt ?? new Date() : null, closureReason: handling === 'CLOSED' ? input.reason : null, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null }, select: caseSelect });
+    if (handling === 'CLOSED' && c.handlingStatus !== 'CLOSED') {
+      if (!input.completionFieldUpdateId) throw new AppError('Select recorded completion evidence', 400, 'INVALID_COMPLETION_EVIDENCE');
+      const evidence = await tx.trFieldUpdate.findFirst({ where: { id: input.completionFieldUpdateId, caseId: id }, select: { id: true, source: true, description: true, observedAt: true } });
+      if (!evidence || evidence.source === reviewerAssessmentSource || evidence.source.trim().length < 3 || evidence.description.trim().length < 5 || evidence.observedAt > new Date()) throw new AppError('Select actual recorded completion evidence from this case', 400, 'INVALID_COMPLETION_EVIDENCE');
+      await audit(tx, actor.id, 'CASE_COMPLETION_EVIDENCE', 'CASE', id, input.reason, { fieldUpdateId: evidence.id, source: evidence.source, observedAt: evidence.observedAt });
+    }
+    const data = await tx.trCase.update({ where: { id, version: input.version }, data: { priority: input.priority, priorityReason: input.priority ? input.reason : undefined, handlingStatus: handling, closedAt: handling === 'CLOSED' ? c.closedAt ?? new Date() : null, closureReason: handling === 'CLOSED' ? c.handlingStatus === 'CLOSED' ? c.closureReason : input.reason : null, completionFieldUpdateId: handling === 'CLOSED' ? c.handlingStatus === 'CLOSED' ? c.completionFieldUpdateId : input.completionFieldUpdateId : null, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null }, select: caseSelect });
     if (handling !== c.handlingStatus) await recordCaseProgress(tx, id, actor.id, handling, input.reporterMessage);
+    if (input.priority && input.priority !== c.priority && input.reporterMessage) await recordCaseProgress(tx, id, actor.id, 'CASE_REVISION', input.reporterMessage);
+    if (input.priority && priorities.indexOf(input.priority) < priorities.indexOf(c.priority) && c.priority !== 'UNASSESSED') await evaluateNearby(tx, undefined, undefined, { caseId: id, version: data.version });
     await audit(tx, actor.id, 'CASE_UPDATED', 'CASE', id, input.reason, { before: { priority: c.priority, handlingStatus: c.handlingStatus }, after: { priority: data.priority, handlingStatus: data.handlingStatus } });
     return data;
-  });
-}
-export async function updateCaseRegion(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
-  const input = caseRegionSchema.parse(body);
-  return client.$transaction(async tx => {
-    await lockedActor(tx, actor, true);
-    await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${id} FOR UPDATE`;
-    const c = await tx.trCase.findUniqueOrThrow({ where: { id } });
-    assertVersion(c.version, input.version);
-    if (input.regionId && !(await tx.msRegion.findFirst({ where: { id: input.regionId, verifiedAt: { not: null }, level: 4, bmkgAdm4: { not: null } }, select: { id: true } }))) throw new AppError('A verified administrative level IV BMKG region mapping is required', 400, 'INVALID_REGION');
-    const data = await tx.trCase.update({ where: { id, version: input.version }, data: { regionId: input.regionId, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null }, select: caseSelect });
-    await audit(tx, actor.id, 'CASE_FORECAST_REGION_CHANGED', 'CASE', id, input.reason, { before: { regionId: c.regionId }, after: { regionId: data.regionId } });
-    return data;
-  });
+  }, { maxWait: 10000, timeout: 30000 });
 }
 export async function addFieldUpdate(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
   const { attachmentIds, ...input } = fieldSchema.parse(body);
   return client.$transaction(async tx => {
     await lockedActor(tx, actor, true);
-    await tx.trCase.findUniqueOrThrow({ where: { id }, select: { id: true } });
-    const item = await tx.trFieldUpdate.create({ data: { ...input, observedAt: new Date(input.observedAt), caseId: id, recorderId: actor.id }, select: { id: true, findings: true, description: true, source: true, observedAt: true, createdAt: true, latitude: true, longitude: true, teamId: true } });
+    const c = await tx.trCase.findUniqueOrThrow({ where: { id }, select: { handlingStatus: true } });
+    assertCaseOpen(c);
+    let assignedTeamId = input.teamId ?? null;
+    if (input.assignmentId) {
+      await tx.$queryRaw`SELECT id FROM "TrAssignment" WHERE id = ${input.assignmentId} FOR SHARE`;
+      const assignment = await tx.trAssignment.findFirst({ where: { id: input.assignmentId, caseId: id, status: { in: ['ACCEPTED', 'IN_PROGRESS', 'COMPLETED'] } }, select: { teamId: true } });
+      if (!assignment || input.teamId && input.teamId !== assignment.teamId) throw new AppError('Field result must reference an eligible assignment from this case', 409, 'INVALID_ASSIGNMENT_EVIDENCE');
+      if (await sampleTarget(tx, 'TEAM', assignment.teamId)) throw new AppError('Sample teams cannot provide operational evidence', 409, 'SAMPLE_DATA');
+      assignedTeamId = assignment.teamId;
+    }
+    const item = await tx.trFieldUpdate.create({ data: { ...input, teamId: assignedTeamId, observedAt: new Date(input.observedAt), caseId: id, recorderId: actor.id }, select: { id: true, findings: true, description: true, source: true, observedAt: true, createdAt: true, latitude: true, longitude: true, teamId: true, assignmentId: true } });
     await attach(tx, actor, attachmentIds, { fieldUpdateId: item.id });
     await bumpContext(tx, id);
     await audit(tx, actor.id, 'FIELD_UPDATE_ADDED', 'CASE', id, undefined, { fieldUpdateId: item.id });
@@ -119,17 +131,19 @@ export async function addFieldUpdate(actor: Actor, id: string, body: unknown, cl
   });
 }
 export async function verifyCase(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
-  const input = verificationSchema.parse(body);
+  const input = normalizeVerification(verificationSchema.parse(body));
   return client.$transaction(async tx => {
+    await lockNearbyWorkflow(tx);
     await lockedActor(tx, actor, true, 'canConfirmIncidents');
-    const authorityReference = input.authorityReference!;
     await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${id} FOR UPDATE`;
     const c = await tx.trCase.findUniqueOrThrow({ where: { id } });
     assertVersion(c.version, input.version);
-    const field = await tx.trFieldUpdate.findFirst({ where: { id: input.fieldUpdateId, caseId: id } });
-    if (!field) throw new AppError('Verification requires field evidence from this case', 400, 'INVALID_EVIDENCE');
-    if (input.outcome === 'CONFIRMED_FIRE' && (field.findings !== 'VISIBLE_FIRE' || field.latitude === null || field.longitude === null || field.source === reviewerAssessmentSource)) throw new AppError('Confirmation requires a coordinate-backed visible-fire field observation', 409, 'INSUFFICIENT_EVIDENCE');
-    if (input.outcome === 'NOT_FIRE' && (field.findings !== 'NO_INDICATION' || field.latitude === null || field.longitude === null || field.source === reviewerAssessmentSource)) throw new AppError('Rejection requires a coordinate-backed no-indication field observation', 409, 'INSUFFICIENT_EVIDENCE');
+    assertCaseOpen(c);
+    const observation = await tx.trFieldUpdate.findFirst({ where: { id: input.observationId, caseId: id }, include: { assignment: { select: { id: true, caseId: true, teamId: true, status: true } } } });
+    if (!observation) throw new AppError('Verification requires a reviewed observation from this case', 400, 'INVALID_EVIDENCE');
+    if (input.outcome === 'CONFIRMED_FIRE' && (observation.source === reviewerAssessmentSource || !isAssignedConfirmationEvidence(observation, id))) throw new AppError('Confirmation requires a coordinate-backed visible-fire result from an assigned team', 409, 'INSUFFICIENT_EVIDENCE');
+    if (input.outcome === 'NOT_FIRE' && (observation.findings !== 'NO_INDICATION' || observation.latitude === null || observation.longitude === null || observation.source === reviewerAssessmentSource)) throw new AppError('Rejection requires a coordinate-backed no-indication observation', 409, 'INSUFFICIENT_EVIDENCE');
+    if (!Number.isFinite(observation.observedAt.getTime()) || observation.observedAt > new Date() || observation.source.trim().length < 3) throw new AppError('Actual past observation time and source are required', 400, 'INVALID_EVIDENCE');
     const next = input.outcome === 'INCONCLUSIVE' ? c.verificationStatus : input.outcome;
     const correction = c.verificationStatus !== 'UNVERIFIED' && next !== c.verificationStatus;
     if (correction) {
@@ -137,14 +151,27 @@ export async function verifyCase(actor: Actor, id: string, body: unknown, client
       if (publications) throw new AppError('Withdraw existing public case claims before correcting verification', 409, 'PUBLICATION_REVIEW_REQUIRED');
     }
     const prior = correction ? await tx.trVerification.findFirst({ where: { caseId: id, outcome: { not: 'INCONCLUSIVE' } }, orderBy: { createdAt: 'desc' } }) : null;
-    await tx.trVerification.create({ data: { caseId: id, decidingAdminId: actor.id, fieldUpdateId: field.id, authorityReference, outcome: correction ? 'CORRECTION' : input.outcome, previousStatus: c.verificationStatus, newStatus: next, reason: input.reason, correctedDecisionId: prior?.id } });
-    const projected = verificationProjection({ verificationStatus: c.verificationStatus, handlingStatus: c.handlingStatus, latitude: c.latitude, longitude: c.longitude }, input.outcome, { latitude: field.latitude, longitude: field.longitude });
-    const result = await tx.trCase.update({ where: { id, version: input.version }, data: { verificationStatus: projected.verificationStatus, handlingStatus: projected.handlingStatus, latitude: projected.latitude, longitude: projected.longitude, ...(input.perimeter ? { perimeter: jsonValue(input.perimeter), perimeterObservedAt: new Date(input.perimeterObservedAt!), perimeterSource: input.perimeterSource!, perimeterRevision: { increment: 1 } } : {}), version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null }, select: caseSelect });
-    if (input.outcome === 'INCONCLUSIVE' || next !== c.verificationStatus) await recordCaseProgress(tx, id, actor.id, correction ? `CORRECTION_${next}` : input.outcome, input.reporterMessage);
-    await audit(tx, actor.id, correction ? 'VERIFICATION_CORRECTED' : 'VERIFICATION_RECORDED', 'CASE', id, input.reason, { outcome: input.outcome, previousStatus: c.verificationStatus, newStatus: next, authorityReference, authorityBasis: 'APPLICATION_ADMIN_ROLE', authorityNoteSource: 'OPERATOR_SUPPLIED', positionSourceFieldUpdateId: input.outcome === 'CONFIRMED_FIRE' && field.latitude !== null ? field.id : null });
-    if (input.perimeter) await audit(tx, actor.id, 'CASE_PERIMETER_UPDATED', 'CASE', id, input.reason, { authorityReference, authorityBasis: 'APPLICATION_ADMIN_ROLE', authorityNoteSource: 'OPERATOR_SUPPLIED', fieldUpdateId: field.id, before: { perimeter: c.perimeter, observedAt: c.perimeterObservedAt, source: c.perimeterSource, revision: c.perimeterRevision }, after: { perimeter: input.perimeter, observedAt: input.perimeterObservedAt, source: input.perimeterSource, revision: c.perimeterRevision + 1 }, areaHectares: areaHectares(input.perimeter) });
+    if (input.outcome === 'CONFIRMED_FIRE') return recordConfirmedCase(tx, {
+      actorId: actor.id,
+      current: c,
+      observation,
+      decisionNote: input.decisionNote,
+      privateReason: input.privateReason,
+      perimeter: input.perimeter,
+      boundaryUsesObservationSourceTime: input.boundaryUsesObservationSourceTime,
+      perimeterObservedAt: input.perimeterObservedAt,
+      perimeterSource: input.perimeterSource,
+      correction,
+      correctedDecisionId: prior?.id ?? null,
+      recordOwnerProgress: true,
+    });
+    await tx.trVerification.create({ data: { caseId: id, decidingAdminId: actor.id, fieldUpdateId: observation.id, authorityReference: applicationAdminAuthority, outcome: correction ? 'CORRECTION' : input.outcome, previousStatus: c.verificationStatus, newStatus: next, reason: input.privateReason ?? input.decisionNote, correctedDecisionId: prior?.id } });
+    const projected = verificationProjection({ verificationStatus: c.verificationStatus, handlingStatus: c.handlingStatus, latitude: c.latitude, longitude: c.longitude }, input.outcome, { latitude: observation.latitude, longitude: observation.longitude });
+    const result = await tx.trCase.update({ where: { id, version: input.version }, data: { verificationStatus: projected.verificationStatus, handlingStatus: projected.handlingStatus, latitude: projected.latitude, longitude: projected.longitude, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null }, select: caseSelect });
+    if (input.outcome === 'INCONCLUSIVE' || next !== c.verificationStatus) await recordCaseProgress(tx, id, actor.id, correction ? `CORRECTION_${next}` : input.outcome, input.decisionNote);
+    await audit(tx, actor.id, correction ? 'VERIFICATION_CORRECTED' : 'VERIFICATION_RECORDED', 'CASE', id, input.privateReason ?? input.decisionNote, { outcome: input.outcome, previousStatus: c.verificationStatus, newStatus: next, authorityReference: applicationAdminAuthority, authorityBasis: applicationAdminAuthority, authorityNoteSource: 'SERVER_DERIVED', observationId: observation.id, observationProvenance: observation.provenance, sourceReportId: observation.sourceReportId, independentFieldObservation: observation.provenance === 'FIELD_OBSERVATION' });
     return result;
-  });
+  }, { maxWait: 10000, timeout: 30000 });
 }
 export async function reviewReport(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
   const input = reviewSchema.parse(body);
@@ -152,13 +179,21 @@ export async function reviewReport(actor: Actor, id: string, body: unknown, clie
     await lockedActor(tx, actor, true);
     await tx.$queryRaw`SELECT id FROM "TrReport" WHERE id = ${id} FOR UPDATE`;
     const report = await tx.trReport.findUniqueOrThrow({ where: { id } });
-    for (const caseId of [...new Set([report.caseId, input.caseId].filter((v): v is string => !!v))].sort()) await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${caseId} FOR UPDATE`;
+    if (input.reviewStatus && report.caseId && await tx.trReport.count({ where: { caseId: report.caseId } }) > 1) throw new AppError('This report belongs to a grouped case; edit the case instead', 409, 'EDIT_CASE_REQUIRED');
+    const caseIds = [...new Set([report.caseId, input.caseId].filter((v): v is string => !!v))].sort();
+    for (const caseId of caseIds) await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${caseId} FOR UPDATE`;
+    for (const caseId of caseIds) assertCaseOpen(await tx.trCase.findUniqueOrThrow({ where: { id: caseId }, select: { handlingStatus: true } }));
     if (input.caseId && input.caseId !== report.caseId) {
       const target = await tx.trCase.findUniqueOrThrow({ where: { id: input.caseId } });
-      if (target.handlingStatus === 'CLOSED' || target.verificationStatus === 'NOT_FIRE') throw new AppError('Reopen or correct the case before linking new evidence', 409, 'CASE_REVIEW_REQUIRED');
+      if (target.verificationStatus === 'NOT_FIRE') throw new AppError('Correct the case before linking new evidence', 409, 'CASE_REVIEW_REQUIRED');
     }
     if (input.reviewStatus === 'UNDER_REVIEW' && report.reviewStatus === 'UNDER_REVIEW') throw new AppError('Review has already started or finished', 409, 'INVALID_TRANSITION');
     const item = await tx.trReport.update({ where: { id }, data: { reviewStatus: input.reviewStatus, caseId: input.caseId }, include: reportInclude });
+    if (input.caseId && input.caseId !== report.caseId && input.reviewStatus === undefined) {
+      const progressId = randomUUID();
+      await tx.trReportProgress.create({ data: { id: progressId, reportId: id, actorId: actor.id, stage: 'OPEN', description: input.reason } });
+      await createReportNotification(tx, { eventKey: `progress:${progressId}`, reportId: id, userId: item.reporterId, type: 'REPORT_HANDLING', stage: 'OPEN', message: input.reason });
+    }
     if (input.reporterMessage && item.reviewStatus !== report.reviewStatus) {
       const progressId = randomUUID();
       await tx.trReportProgress.create({ data: { id: progressId, reportId: id, actorId: actor.id, stage: item.reviewStatus, description: input.reporterMessage } });
@@ -177,70 +212,31 @@ export async function submitReportAction(actor: Actor, id: string, body: unknown
   const input = reportActionSchema.parse(body);
   const hash = fingerprint({ reportId: id, ...input, attachmentIds: [...input.attachmentIds].sort() });
   return client.$transaction(async tx => {
-    const confirming = input.status === 'CONFIRMED_FIRE';
-    await lockedActor(tx, actor, true, confirming ? 'canConfirmIncidents' : undefined);
+    await lockedActor(tx, actor, true);
     await tx.$queryRaw`SELECT id FROM "TrReport" WHERE id = ${id} FOR UPDATE`;
     const report = await tx.trReport.findUniqueOrThrow({ where: { id } });
+    if (report.caseId) {
+      await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${report.caseId} FOR UPDATE`;
+      assertCaseOpen(await tx.trCase.findUniqueOrThrow({ where: { id: report.caseId }, select: { handlingStatus: true } }));
+      if (await tx.trReport.count({ where: { caseId: report.caseId } }) > 1) throw new AppError('This report belongs to a grouped case; edit the case instead', 409, 'EDIT_CASE_REQUIRED');
+    }
     const existing = await tx.trReportProgress.findUnique({ where: { actorId_idempotencyKey: { actorId: actor.id, idempotencyKey: input.idempotencyKey } }, select: { ...progressSelect, payloadHash: true, reportId: true } });
     if (existing) {
       if (existing.payloadHash !== hash || existing.reportId !== id) throw new AppError('Action key already used for different content', 409, 'IDEMPOTENCY_CONFLICT');
       const { payloadHash: _hash, reportId: _reportId, ...safe } = existing;
       return safe;
     }
-    let caseId = report.caseId;
-    let stage: string = input.status;
-    let fieldUpdateId: string | undefined;
-    let progressId: string;
-    if (confirming) {
-      let incident;
-      if (caseId) {
-        await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${caseId} FOR UPDATE`;
-        incident = await tx.trCase.findUniqueOrThrow({ where: { id: caseId } });
-        if (incident.verificationStatus === 'CONFIRMED_FIRE') throw new AppError('This case is already confirmed. Use Revise boundary for an audited perimeter revision.', 409, 'INVALID_TRANSITION');
-        if (input.confirmed.expectedCaseVersion === undefined) throw new AppError('Case version is required; reload and review before confirming', 409, 'VERSION_CONFLICT');
-        assertVersion(incident.version, input.confirmed.expectedCaseVersion);
-      } else {
-        await verifiedRegion(tx, report.regionId);
-        incident = await tx.trCase.create({ data: { number: `C-${randomUUID()}`, title: `Reported observation ${report.number}`, latitude: report.locationMode === 'INCIDENT_ESTIMATE' ? report.latitude : null, longitude: report.locationMode === 'INCIDENT_ESTIMATE' ? report.longitude : null, regionId: report.regionId } });
-        caseId = incident.id;
-      }
-      if (incident.verificationStatus === 'CONFIRMED_FIRE') throw new AppError('This case is already confirmed. Use Revise boundary for an audited perimeter revision.', 409, 'INVALID_TRANSITION');
-      if (incident.verificationStatus !== 'UNVERIFIED') {
-        const publications = await tx.trPublicInformation.count({ where: { caseId: incident.id, status: 'PUBLISHED' } });
-        if (publications) throw new AppError('Withdraw existing public case claims before correcting verification', 409, 'PUBLICATION_REVIEW_REQUIRED');
-      }
-      const progress = await tx.trReportProgress.create({ data: { reportId: id, actorId: actor.id, stage, description: input.description, idempotencyKey: input.idempotencyKey, payloadHash: hash } });
-      progressId = progress.id;
-      const evidence = input.confirmed.evidence;
-      const observedAt = new Date(evidence.observedAt);
-      const field = await tx.trFieldUpdate.create({ data: { caseId: incident.id, recorderId: actor.id, ...evidence, description: input.description, observedAt } });
-      fieldUpdateId = field.id;
-      await attach(tx, actor, input.attachmentIds, { reportProgressId: progress.id, fieldUpdateId: field.id });
-      const correction = incident.verificationStatus !== 'UNVERIFIED';
-      const prior = correction ? await tx.trVerification.findFirst({ where: { caseId: incident.id, outcome: { not: 'INCONCLUSIVE' } }, orderBy: { createdAt: 'desc' } }) : null;
-      const authorityReference = 'APPLICATION_ADMIN_ROLE';
-      await tx.trVerification.create({ data: { caseId: incident.id, decidingAdminId: actor.id, fieldUpdateId: field.id, authorityReference, outcome: correction ? 'CORRECTION' : 'CONFIRMED_FIRE', previousStatus: incident.verificationStatus, newStatus: 'CONFIRMED_FIRE', reason: input.description, correctedDecisionId: prior?.id } });
-      const perimeterSource = evidence.source;
-      const updatedCase = await tx.trCase.update({ where: { id: incident.id, version: incident.version }, data: { verificationStatus: 'CONFIRMED_FIRE', latitude: evidence.latitude, longitude: evidence.longitude, perimeter: jsonValue(input.confirmed.perimeter), perimeterObservedAt: observedAt, perimeterSource, perimeterRevision: { increment: 1 }, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null } });
-      await tx.trReport.update({ where: { id }, data: { reviewStatus: 'REVIEWED', caseId: incident.id } });
-      await audit(tx, actor.id, 'FIELD_UPDATE_ADDED', 'CASE', incident.id, undefined, { fieldUpdateId: field.id, reportId: id, verificationBasis: 'FIELD_OBSERVATION', independentFieldObservation: true, observationTimeBasis: 'OPERATOR_SUPPLIED', locationSource: 'FIELD_OBSERVATION' });
-      await audit(tx, actor.id, correction ? 'VERIFICATION_CORRECTED' : 'VERIFICATION_RECORDED', 'CASE', incident.id, input.description, { outcome: 'CONFIRMED_FIRE', previousStatus: incident.verificationStatus, newStatus: 'CONFIRMED_FIRE', authorityReference, authorityBasis: 'APPLICATION_ADMIN_ROLE', verificationBasis: 'FIELD_OBSERVATION', independentFieldObservation: true, positionSourceFieldUpdateId: field.id, reportId: id });
-      await audit(tx, actor.id, 'CASE_PERIMETER_UPDATED', 'CASE', incident.id, input.description, { authorityReference, authorityBasis: 'APPLICATION_ADMIN_ROLE', verificationBasis: 'FIELD_OBSERVATION', fieldUpdateId: field.id, reportId: id, before: { perimeter: incident.perimeter, observedAt: incident.perimeterObservedAt, source: incident.perimeterSource, revision: incident.perimeterRevision }, after: { perimeter: input.confirmed.perimeter, observedAt, source: perimeterSource, revision: updatedCase.perimeterRevision }, areaHectares: areaHectares(input.confirmed.perimeter) });
-    } else {
-      const reviewStatus = input.status === 'IN_PROGRESS' ? 'UNDER_REVIEW' : input.status;
-      stage = reviewStatus;
-      const progress = await tx.trReportProgress.create({ data: { reportId: id, actorId: actor.id, stage: reviewStatus, description: input.description, idempotencyKey: input.idempotencyKey, payloadHash: hash } });
-      progressId = progress.id;
-      await attach(tx, actor, input.attachmentIds, { reportProgressId: progress.id });
-      await tx.trReport.update({ where: { id }, data: { reviewStatus } });
-      if (caseId && reviewStatus !== report.reviewStatus) await bumpContext(tx, caseId);
-    }
-    await createReportNotification(tx, { eventKey: `progress:${progressId}`, reportId: id, type: input.status === 'CONFIRMED_FIRE' ? 'REPORT_VERIFICATION' : 'REPORT_STATUS', stage, message: input.description });
-    await audit(tx, actor.id, 'REPORT_ACTION_RECORDED', 'REPORT', id, input.description, { status: input.status, progressId, caseId, fieldUpdateId, attachmentCount: input.attachmentIds.length });
-    return tx.trReportProgress.findUniqueOrThrow({ where: { id: progressId }, select: progressSelect });
+    const reviewStatus = input.status === 'IN_PROGRESS' ? 'UNDER_REVIEW' : input.status;
+    const progress = await tx.trReportProgress.create({ data: { reportId: id, actorId: actor.id, stage: reviewStatus, description: input.description, idempotencyKey: input.idempotencyKey, payloadHash: hash } });
+    await attach(tx, actor, input.attachmentIds, { reportProgressId: progress.id });
+    await tx.trReport.update({ where: { id }, data: { reviewStatus } });
+    if (report.caseId && reviewStatus !== report.reviewStatus) await bumpContext(tx, report.caseId);
+    await createReportNotification(tx, { eventKey: `progress:${progress.id}`, reportId: id, type: 'REPORT_STATUS', stage: reviewStatus, message: input.description });
+    await audit(tx, actor.id, 'REPORT_ACTION_RECORDED', 'REPORT', id, input.description, { status: input.status, progressId: progress.id, caseId: report.caseId, attachmentCount: input.attachmentIds.length });
+    return tx.trReportProgress.findUniqueOrThrow({ where: { id: progress.id }, select: progressSelect });
   }, { maxWait: 2000, timeout: 15000 });
 }
-const assignmentSelect = { id: true, caseId: true, teamId: true, status: true, notes: true, version: true, createdAt: true, updatedAt: true } as const;
+const assignmentSelect = { id: true, caseId: true, teamId: true, status: true, notes: true, version: true, acceptedAt: true, startedAt: true, completedAt: true, cancelledAt: true, createdAt: true, updatedAt: true } as const;
 export async function assignTeam(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
   const input = assignmentSchema.parse(body);
   const payloadHash = fingerprint({ caseId: id, ...input });
@@ -257,7 +253,8 @@ export async function assignTeam(actor: Actor, id: string, body: unknown, client
     await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${id} FOR UPDATE`;
     const c = await tx.trCase.findUniqueOrThrow({ where: { id } });
     assertVersion(c.version, input.version);
-    if (c.handlingStatus === 'CLOSED' || c.verificationStatus === 'NOT_FIRE') throw new AppError('Case must be open for investigation or response', 409, 'INVALID_TRANSITION');
+    assertCaseOpen(c);
+    if (c.verificationStatus === 'NOT_FIRE') throw new AppError('Case must be open for investigation or response', 409, 'INVALID_TRANSITION');
     const team = await tx.msTeam.findFirst({ where: { id: input.teamId, active: true } });
     if (!team) throw new AppError('Team not available', 400, 'INVALID_TEAM');
     const sample = await tx.trAuditLog.findFirst({ where: { systemActor: 'sample-operations-v1', action: 'SAMPLE_OPERATION_CREATED', targetType: 'TEAM', targetId: team.id }, select: { id: true } });
@@ -267,6 +264,7 @@ export async function assignTeam(actor: Actor, id: string, body: unknown, client
     if (!latest || latest.condition !== 'AVAILABLE' || !fresh(latest.observedAt, new Date())) throw new AppError('Record a current team availability update before assigning', 409, 'TEAM_STATUS_UNKNOWN');
     const { reason, idempotencyKey, version: _version, ...data } = input;
     const item = await tx.trAssignment.create({ data: { ...data, caseId: id, assigningAdminId: actor.id, idempotencyKey, payloadHash }, select: assignmentSelect });
+    await tx.trOperationalUpdate.create({ data: { recorderId: actor.id, subjectType: 'TEAM', teamId: team.id, condition: 'DEPLOYED', source: `Assignment ${item.id} to ${c.number}`, observedAt: new Date(), notes: input.notes, idempotencyKey: `assignment:${item.id}:deployed`, payloadHash } });
     await bumpContext(tx, id);
     await audit(tx, actor.id, 'TEAM_ASSIGNED', 'CASE', id, reason, { assignmentId: item.id, teamId: team.id, idempotencyKey, payloadHash });
     return item;
@@ -282,10 +280,17 @@ export async function updateAssignment(actor: Actor, id: string, body: unknown, 
     await tx.$queryRaw`SELECT id FROM "TrAssignment" WHERE id = ${id} FOR UPDATE`;
     const item = await tx.trAssignment.findUniqueOrThrow({ where: { id } });
     assertVersion(item.version, input.version);
+    assertCaseOpen(await tx.trCase.findUniqueOrThrow({ where: { id: item.caseId }, select: { handlingStatus: true } }));
     if (await sampleTarget(tx, 'TEAM', item.teamId)) throw new AppError('Sample assignments are read-only', 409, 'SAMPLE_DATA');
     const allowed: Record<string, readonly string[]> = { ASSIGNED: ['ACCEPTED', 'CANCELLED'], ACCEPTED: ['IN_PROGRESS', 'CANCELLED'], IN_PROGRESS: ['COMPLETED', 'CANCELLED'] };
     if (!allowed[item.status]?.includes(input.status)) throw new AppError('Only the next assignment stage or cancellation is allowed', 409, 'INVALID_TRANSITION');
-    const changed = await tx.trAssignment.updateMany({ where: { id, version: input.version }, data: { status: input.status, version: { increment: 1 } } });
+    if (input.status === 'COMPLETED') {
+      const result = await tx.trFieldUpdate.findFirst({ where: { id: input.fieldUpdateId, assignmentId: id, caseId: item.caseId, teamId: item.teamId }, select: { id: true } });
+      if (!result) throw new AppError('Completion requires a field result from this assignment', 409, 'ASSIGNMENT_RESULT_REQUIRED');
+    }
+    const now = new Date();
+    const timestamps = input.status === 'ACCEPTED' ? { acceptedAt: now } : input.status === 'IN_PROGRESS' ? { startedAt: now } : input.status === 'COMPLETED' ? { completedAt: now } : input.status === 'CANCELLED' ? { cancelledAt: now } : {};
+    const changed = await tx.trAssignment.updateMany({ where: { id, version: input.version }, data: { status: input.status, ...timestamps, version: { increment: 1 } } });
     if (!changed.count) throw new AppError('Record changed; reload before continuing', 409, 'VERSION_CONFLICT');
     const updated = await tx.trAssignment.findUniqueOrThrow({ where: { id }, select: assignmentSelect });
     await bumpContext(tx, item.caseId);
@@ -293,8 +298,8 @@ export async function updateAssignment(actor: Actor, id: string, body: unknown, 
     return updated;
   });
 }
-const adminUserSelect = { id: true, name: true, email: true, emailVerified: true, role: true, active: true, createdAt: true, updatedAt: true } as const;
-const adminUserDto = (user: { id: string; name: string; email: string; emailVerified: boolean; role: string; active: boolean; createdAt: Date; updatedAt: Date }) => ({ ...user, ...effectiveCapabilities(user) });
+const adminUserSelect = { id: true, name: true, email: true, image: true, emailVerified: true, role: true, active: true, createdAt: true, updatedAt: true } as const;
+const adminUserDto = (user: { id: string; name: string; email: string; image: string | null; emailVerified: boolean; role: string; active: boolean; createdAt: Date; updatedAt: Date }) => ({ ...user, ...effectiveCapabilities(user) });
 export async function listUsers(query: unknown) {
   const { page, pageSize, search, role, active, emailVerified } = paginationSchema.extend({ role: z.enum(['USER', 'ADMIN']).optional(), active: z.enum(['true', 'false']).transform(value => value === 'true').optional(), emailVerified: z.enum(['true', 'false']).transform(value => value === 'true').optional() }).parse(query);
   const where = { role, active, emailVerified, ...(search ? { OR: [{ name: { contains: search, mode: 'insensitive' as const } }, { email: { contains: search, mode: 'insensitive' as const } }] } : {}) };
@@ -348,7 +353,7 @@ export async function monitoringSummary() {
   ]);
   const byVerification = { UNVERIFIED: 0, CONFIRMED_FIRE: 0, NOT_FIRE: 0 };
   const byHandling = { OPEN: 0, CHECK_SCHEDULED: 0, ON_SCENE: 0, RESPONDING: 0, MONITORING: 0, CLOSED: 0 };
-  const byPriority = { HIGH: 0, MEDIUM: 0, LOW: 0, UNASSESSED: 0 };
+  const byPriority = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, UNASSESSED: 0 };
   const byReviewStatus = { NEW: 0, UNDER_REVIEW: 0, NEEDS_DETAILS: 0, REVIEWED: 0, DECLINED: 0 };
   for (const item of caseVerificationGroups) byVerification[item.verificationStatus] = item._count._all;
   for (const item of caseHandlingGroups) byHandling[item.handlingStatus] = item._count._all;
@@ -377,16 +382,33 @@ export async function operations() {
     tx.msTeam.findMany({ select: { ...teamSelect, updates: { select: updateSelect, take: 1, orderBy: [{ observedAt: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }] }, _count: { select: { assignments: { where: { status: { in: [...activeAssignments] } } } } } }, orderBy: [{ name: 'asc' }, { id: 'asc' }] }),
     tx.msEquipment.findMany({ select: equipmentSelect, take: 300, orderBy: { name: 'asc' } }),
     tx.trOperationalUpdate.findMany({ select: updateSelect, take: 1000, orderBy: [{ observedAt: 'desc' }, { id: 'desc' }] }),
-    tx.trAssignment.findMany({ select: { ...assignmentSelect, case: { select: { number: true, title: true, verificationStatus: true, handlingStatus: true } }, team: { select: { name: true } } }, orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }] }),
-    tx.msMapFeature.findMany({ where: { kind: { in: ['ROAD', 'RIVER', 'WATER_SOURCE', 'DESIGNATED_LOCATION'] } }, select: { id: true, name: true, kind: true, layer: { select: { provider: true, verifiedAt: true } } }, take: 300, orderBy: { name: 'asc' } }),
+    tx.trAssignment.findMany({ select: { ...assignmentSelect, fieldUpdates: { select: { id: true, findings: true, observedAt: true }, orderBy: { observedAt: 'desc' }, take: 1 }, case: { select: { number: true, title: true, verificationStatus: true, handlingStatus: true } }, team: { select: { name: true } } }, orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }] }),
+    tx.msMapFeature.findMany({ where: { kind: { in: ['ROAD', 'RIVER', 'WATER_SOURCE', 'DESIGNATED_LOCATION'] } }, select: { id: true, name: true, kind: true, geometry: true, layer: { select: { provider: true, verifiedAt: true } } }, take: 300, orderBy: { name: 'asc' } }),
     tx.trAuditLog.findMany({ where: { systemActor: sampleActor, action: 'SAMPLE_OPERATION_CREATED', targetType: { in: ['TEAM', 'EQUIPMENT', 'FEATURE', 'OPERATIONAL_UPDATE'] } }, select: { targetType: true, targetId: true } }),
   ]), { isolationLevel: 'RepeatableRead', maxWait: 10000, timeout: 30000 });
   const sampleKeys = new Set(sampleAudits.map(item => `${item.targetType}:${item.targetId}`));
-  const updates = rawUpdates.map(value => ({ ...value, subjectId: value.teamId ?? value.equipmentId ?? value.featureId!, sample: sampleKeys.has(`OPERATIONAL_UPDATE:${value.id}`) }));
-  const teamRows = teams.map(({ updates: history, _count, ...item }) => { const latest = history[0]; return { ...item, activeAssignmentCount: _count.assignments, sample: sampleKeys.has(`TEAM:${item.id}`), latestCondition: latest?.condition ?? null, latestObservedAt: latest?.observedAt ?? null }; });
-  const equipmentRows = equipment.map(item => { const latest = currentCondition(updates, item.id); return { ...item, sample: sampleKeys.has(`EQUIPMENT:${item.id}`), latestCondition: latest?.condition ?? null, latestObservedAt: latest?.observedAt ?? null }; });
-  const features = rawFeatures.map(item => { const latest = currentCondition(updates, item.id); const sample = sampleKeys.has(`FEATURE:${item.id}`) || item.layer.provider === 'SAMPLE'; return { id: item.id, name: item.name, kind: item.kind, provider: item.layer.provider, verifiedAt: item.layer.verifiedAt, authoritative: !sample && item.layer.verifiedAt !== null, sample, latestCondition: latest?.condition ?? null, latestObservedAt: latest?.observedAt ?? null }; });
-  const assignmentRows = assignments.map(({ case: incident, team, ...item }) => ({ ...item, caseNumber: incident.number, caseTitle: incident.title, caseVerification: incident.verificationStatus, caseHandling: incident.handlingStatus, teamName: team.name, sample: sampleKeys.has(`TEAM:${item.teamId}`) }));
+  const updates = rawUpdates.flatMap(value => sampleKeys.has(`OPERATIONAL_UPDATE:${value.id}`) ? [] : [{ ...value, subjectId: value.teamId ?? value.equipmentId ?? value.featureId!, sample: false }]);
+  const assignmentRows = assignments.flatMap(({ case: incident, team, fieldUpdates, ...item }) => sampleKeys.has(`TEAM:${item.teamId}`) ? [] : [{ ...item, sample: false, result: fieldUpdates[0] ?? null, caseNumber: incident.number, caseTitle: incident.title, caseVerification: incident.verificationStatus, caseHandling: incident.handlingStatus, teamName: team.name }]);
+  const teamRows = teams.flatMap(({ updates: history, _count, ...item }) => {
+    if (sampleKeys.has(`TEAM:${item.id}`)) return [];
+    const latest = history[0], historyAssignments = assignmentRows.filter(assignment => assignment.teamId === item.id);
+    const completed = historyAssignments.filter(assignment => assignment.status === 'COMPLETED');
+    const durations = completed.flatMap(assignment => assignment.startedAt && assignment.completedAt ? [assignment.completedAt.getTime() - assignment.startedAt.getTime()] : []);
+    return [{ ...item, sample: false, activeAssignmentCount: _count.assignments, latestCondition: latest?.condition ?? null, latestObservedAt: latest?.observedAt ?? null, performance: { totalAssignments: historyAssignments.length, completedAssignments: completed.length, cancelledAssignments: historyAssignments.filter(assignment => assignment.status === 'CANCELLED').length, fieldResults: historyAssignments.filter(assignment => assignment.result).length, averageCompletionMinutes: durations.length ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length / 60000) : null } }];
+  });
+  const equipmentRows = equipment.flatMap(item => {
+    if (sampleKeys.has(`EQUIPMENT:${item.id}`)) return [];
+    const latest = currentCondition(updates, item.id), currentAssignment = item.teamId ? assignmentRows.find(assignment => assignment.teamId === item.teamId && activeAssignments.includes(assignment.status as typeof activeAssignments[number])) : undefined;
+    return [{ ...item, sample: false, latestCondition: latest?.condition ?? null, latestObservedAt: latest?.observedAt ?? null, currentAssignment: currentAssignment ? { id: currentAssignment.id, caseId: currentAssignment.caseId, caseNumber: currentAssignment.caseNumber, caseTitle: currentAssignment.caseTitle, status: currentAssignment.status } : null }];
+  });
+  const features = rawFeatures.flatMap(item => {
+    const latest = currentCondition(updates, item.id), sample = sampleKeys.has(`FEATURE:${item.id}`) || item.layer.provider === 'SAMPLE';
+    if (sample) return [];
+    const point = z.object({ type: z.literal('Point'), coordinates: z.tuple([z.number().finite(), z.number().finite()]) }).safeParse(item.geometry);
+    const line = z.object({ type: z.literal('LineString'), coordinates: z.array(z.tuple([z.number().finite(), z.number().finite()])).min(2) }).safeParse(item.geometry);
+    const coordinates = point.success ? point.data.coordinates : line.success ? line.data.coordinates[Math.floor(line.data.coordinates.length / 2)]! : null;
+    return coordinates ? [{ id: item.id, name: item.name, kind: item.kind, latitude: coordinates[1], longitude: coordinates[0], provider: item.layer.provider, verifiedAt: item.layer.verifiedAt, authoritative: item.layer.verifiedAt !== null, sample: false, latestCondition: latest?.condition ?? null, latestObservedAt: latest?.observedAt ?? null }] : [];
+  });
   return {
     asOf: now,
     teams: teamRows,
@@ -406,6 +428,54 @@ export async function operations() {
       availableWater: features.filter(item => ['RIVER', 'WATER_SOURCE'].includes(item.kind) && item.authoritative && item.latestCondition === 'WATER_AVAILABLE' && fresh(item.latestObservedAt ?? undefined, now)).length,
     },
   };
+}
+function operationalUpdateDto(item: { id: string; subjectType: string; teamId: string | null; equipmentId: string | null; featureId: string | null; condition: string; source: string; observedAt: Date; notes: string | null; createdAt: Date }) {
+  return { ...item, subjectType: item.subjectType as 'TEAM' | 'EQUIPMENT' | 'FEATURE', subjectId: item.teamId ?? item.equipmentId ?? item.featureId!, sample: false };
+}
+export async function getTeam(id: string, client: PrismaClient = db()) {
+  const [item, assignments, updates, sample] = await Promise.all([
+    client.msTeam.findUnique({ where: { id }, select: { ...teamSelect, _count: { select: { assignments: { where: { status: { in: [...activeAssignments] } } } } } } }),
+    client.trAssignment.findMany({ where: { teamId: id }, select: { status: true, startedAt: true, completedAt: true, fieldUpdates: { select: { id: true }, take: 1 } } }),
+    client.trOperationalUpdate.findMany({ where: { teamId: id }, select: updateSelect, take: 100, orderBy: [{ observedAt: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }] }),
+    client.trAuditLog.findFirst({ where: { systemActor: sampleActor, action: 'SAMPLE_OPERATION_CREATED', targetType: 'TEAM', targetId: id }, select: { id: true } }),
+  ]);
+  if (!item || sample) throw new AppError('Team not found', 404, 'NOT_FOUND');
+  const completed = assignments.filter(value => value.status === 'COMPLETED');
+  const durations = completed.flatMap(value => value.startedAt && value.completedAt ? [value.completedAt.getTime() - value.startedAt.getTime()] : []);
+  const latest = updates[0];
+  return { item: { ...item, _count: undefined, sample: false, activeAssignmentCount: item._count.assignments, latestCondition: latest?.condition ?? null, latestObservedAt: latest?.observedAt ?? null, performance: { totalAssignments: assignments.length, completedAssignments: completed.length, cancelledAssignments: assignments.filter(value => value.status === 'CANCELLED').length, fieldResults: assignments.filter(value => value.fieldUpdates.length).length, averageCompletionMinutes: durations.length ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length / 60000) : null } }, updates: updates.map(operationalUpdateDto) };
+}
+export async function getEquipment(id: string, client: PrismaClient = db()) {
+  const [item, updates, teams, sample] = await Promise.all([
+    client.msEquipment.findUnique({ where: { id }, select: equipmentSelect }),
+    client.trOperationalUpdate.findMany({ where: { equipmentId: id }, select: updateSelect, take: 100, orderBy: [{ observedAt: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }] }),
+    client.msTeam.findMany({ where: { active: true }, select: { id: true, name: true, active: true }, orderBy: [{ name: 'asc' }, { id: 'asc' }] }),
+    client.trAuditLog.findFirst({ where: { systemActor: sampleActor, action: 'SAMPLE_OPERATION_CREATED', targetType: 'EQUIPMENT', targetId: id }, select: { id: true } }),
+  ]);
+  if (!item || sample) throw new AppError('Equipment not found', 404, 'NOT_FOUND');
+  const assignment = item.teamId ? await client.trAssignment.findFirst({ where: { teamId: item.teamId, status: { in: [...activeAssignments] } }, select: { id: true, caseId: true, status: true, case: { select: { number: true, title: true } } }, orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }] }) : null;
+  const latest = updates[0];
+  return { item: { ...item, sample: false, latestCondition: latest?.condition ?? null, latestObservedAt: latest?.observedAt ?? null, currentAssignment: assignment ? { id: assignment.id, caseId: assignment.caseId, caseNumber: assignment.case.number, caseTitle: assignment.case.title, status: assignment.status } : null }, teams, updates: updates.map(operationalUpdateDto) };
+}
+export async function getAssignment(id: string, client: PrismaClient = db()) {
+  const item = await client.trAssignment.findUnique({ where: { id }, select: { ...assignmentSelect, fieldUpdates: { select: { id: true, findings: true, observedAt: true }, orderBy: { observedAt: 'desc' }, take: 1 }, case: { select: { number: true, title: true, verificationStatus: true, handlingStatus: true } }, team: { select: { name: true } } } });
+  if (!item || await client.trAuditLog.findFirst({ where: { systemActor: sampleActor, action: 'SAMPLE_OPERATION_CREATED', targetType: 'TEAM', targetId: item.teamId }, select: { id: true } })) throw new AppError('Assignment not found', 404, 'NOT_FOUND');
+  const { case: incident, team, fieldUpdates, ...fields } = item;
+  return { ...fields, sample: false, result: fieldUpdates[0] ?? null, caseNumber: incident.number, caseTitle: incident.title, caseVerification: incident.verificationStatus, caseHandling: incident.handlingStatus, teamName: team.name };
+}
+export async function getOperationalFeature(id: string, client: PrismaClient = db()) {
+  const [item, updates, sample] = await Promise.all([
+    client.msMapFeature.findFirst({ where: { id, kind: { in: ['ROAD', 'RIVER', 'WATER_SOURCE', 'DESIGNATED_LOCATION'] } }, select: { id: true, name: true, kind: true, geometry: true, layer: { select: { provider: true, verifiedAt: true } } } }),
+    client.trOperationalUpdate.findMany({ where: { featureId: id }, select: updateSelect, take: 100, orderBy: [{ observedAt: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }] }),
+    client.trAuditLog.findFirst({ where: { systemActor: sampleActor, action: 'SAMPLE_OPERATION_CREATED', targetType: 'FEATURE', targetId: id }, select: { id: true } }),
+  ]);
+  if (!item || sample || item.layer.provider === 'SAMPLE') throw new AppError('Operational feature not found', 404, 'NOT_FOUND');
+  const point = z.object({ type: z.literal('Point'), coordinates: z.tuple([z.number().finite(), z.number().finite()]) }).safeParse(item.geometry);
+  const line = z.object({ type: z.literal('LineString'), coordinates: z.array(z.tuple([z.number().finite(), z.number().finite()])).min(2) }).safeParse(item.geometry);
+  const coordinates = point.success ? point.data.coordinates : line.success ? line.data.coordinates[Math.floor(line.data.coordinates.length / 2)]! : null;
+  if (!coordinates) throw new AppError('Operational feature location unavailable', 404, 'NOT_FOUND');
+  const latest = updates[0];
+  return { item: { id: item.id, name: item.name, kind: item.kind, latitude: coordinates[1], longitude: coordinates[0], provider: item.layer.provider, verifiedAt: item.layer.verifiedAt, authoritative: item.layer.verifiedAt !== null, sample: false, latestCondition: latest?.condition ?? null, latestObservedAt: latest?.observedAt ?? null }, updates: updates.map(operationalUpdateDto) };
 }
 export async function createTeam(actor: Actor, body: unknown, client: PrismaClient = db()) {
   const input = teamSchema.parse(body);
@@ -476,6 +546,27 @@ export async function updateEquipment(actor: Actor, id: string, body: unknown, c
     return updated;
   });
 }
+export async function createOperationalFeature(actor: Actor, body: unknown, client: PrismaClient = db()) {
+  const input = operationalFeatureSchema.parse(body);
+  const payloadHash = fingerprint({ actorId: actor.id, ...input });
+  return client.$transaction(async tx => {
+    await lockedActor(tx, actor, true);
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${input.idempotencyKey}, 0))`;
+    const existing = await tx.trAuditLog.findFirst({ where: { actorId: actor.id, action: 'OPERATIONAL_FEATURE_CREATED', details: { path: ['idempotencyKey'], equals: input.idempotencyKey } }, select: { targetId: true, details: true } });
+    if (existing) {
+      const details = existing.details as Record<string, unknown> | null;
+      if (details?.payloadHash !== payloadHash) throw new AppError('Feature key already used for different content', 409, 'IDEMPOTENCY_CONFLICT');
+      return tx.msMapFeature.findUniqueOrThrow({ where: { id: existing.targetId }, select: { id: true, name: true, kind: true, geometry: true } });
+    }
+    const now = new Date();
+    const layer = await tx.msMapLayer.upsert({ where: { provider_name_version: { provider: 'Blazemap', name: 'Operator operational points', version: '1' } }, update: { verifiedAt: now }, create: { provider: 'Blazemap', name: 'Operator operational points', version: '1', kind: 'DESIGNATED_LOCATION', sourceUrl: 'urn:blazemap:operator-operational-points', license: 'Restricted operational data', attribution: 'Blazemap authorized operators', coverage: 'Operator-recorded access and water points; point records do not establish full route usability', sourceDate: now, verifiedAt: now } });
+    const feature = await tx.msMapFeature.create({ data: { layerId: layer.id, sourceId: `operator:${input.idempotencyKey}`, kind: input.kind, name: input.name, geometry: jsonValue({ type: 'Point', coordinates: [input.longitude, input.latitude] }), attributes: jsonValue({ source: input.source, observedAt: input.observedAt, pointMeaning: input.kind === 'ROAD' ? 'ACCESS_POINT' : 'WATER_SOURCE_POINT' }) }, select: { id: true, name: true, kind: true, geometry: true } });
+    await tx.trOperationalUpdate.create({ data: { recorderId: actor.id, subjectType: 'FEATURE', featureId: feature.id, condition: input.condition, source: input.source, observedAt: new Date(input.observedAt), notes: input.reason, idempotencyKey: input.idempotencyKey, payloadHash }, select: updateSelect });
+    await audit(tx, actor.id, 'OPERATIONAL_FEATURE_CREATED', 'FEATURE', feature.id, input.reason, { idempotencyKey: input.idempotencyKey, payloadHash, latitude: input.latitude, longitude: input.longitude, kind: input.kind });
+    return feature;
+  });
+}
+
 export async function addOperationalUpdate(actor: Actor, body: unknown, client: PrismaClient = db()) {
   const input = operationalSchema.parse(body);
   const payloadHash = fingerprint({ actorId: actor.id, ...input });

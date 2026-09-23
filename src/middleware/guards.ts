@@ -25,7 +25,7 @@ export const originGuard: RequestHandler = (req, _res, next) => {
   if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     const origin = req.headers.origin;
     if (!origin || !origins.includes(origin)) throw new AppError('Request origin not allowed', 403, 'INVALID_ORIGIN');
-    const avatarUpload = req.method === 'POST' && /^\/api\/profile\/[a-zA-Z0-9_-]+\/avatar$/.test(req.path) && req.is('image/jpeg');
+    const avatarUpload = req.method === 'POST' && /^\/api\/(?:profile|admin\/users)\/[a-zA-Z0-9_-]+\/avatar$/.test(req.path) && req.is('image/jpeg');
     if (!avatarUpload && !req.is('application/json')) throw new AppError('Unsupported request content type', 415, 'INVALID_CONTENT_TYPE');
   }
   next();

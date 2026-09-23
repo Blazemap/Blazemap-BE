@@ -17,6 +17,9 @@ export function assertPublicationRevision(actual: Date, expected: string) {
 export function assertVersion(actual: number, expected: number) {
   if (actual !== expected) throw new AppError('Record changed; reload before continuing', 409, 'VERSION_CONFLICT');
 }
+export function assertCaseOpen(item: { handlingStatus: string }) {
+  if (item.handlingStatus === 'CLOSED') throw new AppError('Closed cases are read-only; create or revise the completion News instead', 409, 'CASE_CLOSED');
+}
 export function transition(verification: VerificationStatus, handling: HandlingStatus, activeAssignments: number) {
   if (handling === 'RESPONDING' && verification !== 'CONFIRMED_FIRE') throw new AppError('Response requires a confirmed fire', 409, 'INVALID_TRANSITION');
   if (handling === 'CLOSED' && activeAssignments > 0) throw new AppError('Complete or cancel active assignments before closing', 409, 'ACTIVE_ASSIGNMENTS');

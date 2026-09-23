@@ -1,2 +1,2 @@
-export { approveMedia, publicDownload, revokeMedia } from './media.service.js';
-export { createIntent, finalize, download, cleanupUploads } from './uploads.service.js';
+export { approveMedia, publicContent, publicDownload, revokeMedia } from './media.service.js';
+export { createIntent, finalize, download, privateContent, cleanupUploads } from './uploads.service.js';

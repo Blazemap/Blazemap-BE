@@ -22,7 +22,8 @@
     "sources:watch": "tsx src/watch.ts",
     "seed:areas": "tsx src/seed-areas.ts",
     "seed:test-accounts": "tsx src/seed-test-accounts.ts",
-    "seed:sample-operations": "tsx src/seed-sample-operations.ts"
+    "seed:demo-operations": "tsx src/seed-demo-operations.ts",
+    "import:operations": "tsx src/import-operations.ts"
   },
   "overrides": {
     "deepmerge-ts": "8.0.2",

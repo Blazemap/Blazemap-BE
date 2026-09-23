@@ -14,7 +14,7 @@ export function createApp() {
   app.set('trust proxy', env.TRUST_PROXY_HOPS);
   app.use(helmet());
   app.use(requestLogger);
-  app.use(cors({ origin: origins, credentials: true, methods: ['GET', 'POST', 'PATCH', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'], exposedHeaders: ['Retry-After', 'X-Retry-After'] }));
+  app.use(cors({ origin: origins, credentials: true, methods: ['GET', 'POST', 'PATCH', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Blazemap-Expected-Updated-At', 'X-Blazemap-Audit-Reason'], exposedHeaders: ['Retry-After', 'X-Retry-After'] }));
   app.use((_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
   app.use(rateLimit({ windowMs: 60000, limit: 180, standardHeaders: 'draft-8', legacyHeaders: false, message: { message: 'Too many requests', code: 'RATE_LIMIT' } }));
   app.get('/health', async (_req, res) => { const ready = await databaseAvailable(); res.status(ready ? 200 : 503).json({ status: ready ? 'ok' : 'unavailable' }); });

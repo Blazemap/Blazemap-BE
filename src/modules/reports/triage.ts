@@ -1,6 +1,7 @@
 import { z } from 'zod';
-import type { PrismaClient, TrReport } from '../../generated/prisma/client.js';
+import type { Prisma, PrismaClient, TrReport } from '../../generated/prisma/client.js';
 import { env } from '../../config/env.js';
+import { AppError } from '../../utils/index.js';
 import { firmsConfigured } from '../integrations/integrations.service.js';
 import { geometryDistanceMeters, prepareGeometryDistance, type Position } from '../../utils/geometry.js';
 
@@ -26,7 +27,7 @@ function covers(bbox: [number, number, number, number], point: Position, radius:
   const lon = lat / cosine;
   return point[0] - lon >= w && point[0] + lon <= e && point[1] - lat >= s && point[1] + lat <= n;
 }
-export async function triageReports(reports: Report[], client: PrismaClient, policy: TriagePolicy = env, now = new Date(), sourceConfigured = firmsConfigured()): Promise<Map<string, Triage>> {
+export async function triageReports(reports: Report[], client: PrismaClient | Prisma.TransactionClient, policy: TriagePolicy = env, now = new Date(), sourceConfigured = firmsConfigured()): Promise<Map<string, Triage>> {
   const names = ['TRIAGE_HOTSPOT_RADIUS_METERS', 'TRIAGE_HOTSPOT_WINDOW_HOURS', 'TRIAGE_SETTLEMENT_RADIUS_METERS'] as const;
   const missingPolicy = names.filter(name => !policy[name]?.trim() || !Number.isFinite(Number(policy[name])) || Number(policy[name]) <= 0);
   const radius = Number(policy.TRIAGE_HOTSPOT_RADIUS_METERS), windowMs = Number(policy.TRIAGE_HOTSPOT_WINDOW_HOURS) * 3600000, settlementRadius = Number(policy.TRIAGE_SETTLEMENT_RADIUS_METERS);
@@ -52,6 +53,7 @@ export async function triageReports(reports: Report[], client: PrismaClient, pol
     client.msMapLayer.findMany({ where: { kind: 'SETTLEMENT', verifiedAt: { not: null } }, select: { id: true, name: true, provider: true, sourceDate: true, verifiedAt: true, coverage: true }, orderBy: { id: 'asc' }, take: 1001 }),
     client.trIntegrationRun.findFirst({ where: { provider: 'FIRMS', status: { in: ['SUCCEEDED', 'FAILED'] } }, select: { status: true, completedAt: true, scope: true }, orderBy: [{ startedAt: 'desc' }, { id: 'desc' }] }),
   ]);
+  if (hotspots.length > 10000 || settlements.length > 10000 || layers.length > 1000) throw new AppError('Triage context exceeds the evaluation limit. No partial priority assessment is returned.', 503, 'TRIAGE_CONTEXT_TOO_LARGE');
   const usableLayers = layers.slice(0, 1000).filter(layer => !demo(layer.provider, layer.name) && layer.verifiedAt && layer.verifiedAt <= now && layer.sourceDate <= now);
   const layerIds = new Set(usableLayers.map(layer => layer.id));
   const preparedSettlements = settlements.slice(0, 10000).filter(settlement => layerIds.has(settlement.layerId) && !demo(settlement.name, settlement.attributes)).map(settlement => ({ layerId: settlement.layerId, name: settlement.name, distance: prepareGeometryDistance(settlement.geometry) }));

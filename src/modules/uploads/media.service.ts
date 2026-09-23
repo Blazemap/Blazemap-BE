@@ -53,10 +53,24 @@ export async function approveMedia(actor: Actor, publicationId: string, body: un
   }
 }
 export async function publicDownload(id: string) {
-  const item = await db().trAttachment.findFirst({ where: { id, state: 'ATTACHED', revokedAt: null, approvedAt: { not: null }, approvedById: { not: null }, publication: { status: 'PUBLISHED', OR: [{ validUntil: null }, { validUntil: { gt: new Date() } }] } }, select: { objectKey: true, detectedType: true } });
-  if (!item) throw new AppError('Media not found', 404, 'NOT_FOUND');
-  try { return { url: await getSignedUrl(storage(), new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: item.objectKey, ResponseContentType: item.detectedType!, ResponseContentDisposition: 'inline' }), { expiresIn: 60 }) }; }
+  const item = await publicMediaItem(id);
+  try { return { url: await getSignedUrl(storage(), new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: item.objectKey, ResponseContentType: item.contentType, ResponseContentDisposition: 'inline' }), { expiresIn: 60 }) }; }
   catch { throw unavailable('Public media'); }
+}
+async function publicMediaItem(id: string) {
+  const item = await db().trAttachment.findFirst({ where: { id, state: 'ATTACHED', revokedAt: null, approvedAt: { not: null }, approvedById: { not: null }, sourceAttachmentId: { not: null }, publication: { status: 'PUBLISHED', OR: [{ validUntil: null }, { validUntil: { gt: new Date() } }] } }, select: { objectKey: true, detectedType: true } });
+  if (!item?.detectedType) throw new AppError('Media not found', 404, 'NOT_FOUND');
+  return { objectKey: item.objectKey, contentType: item.detectedType };
+}
+export async function publicContent(id: string) {
+  const item = await publicMediaItem(id);
+  try {
+    const object = await storage().send(new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: item.objectKey }), { abortSignal: AbortSignal.timeout(15000) });
+    if (!object.Body) throw unavailable('Public media');
+    const bytes = Buffer.from(await object.Body.transformToByteArray());
+    if (!bytes.length || bytes.length > 5 * 1024 * 1024) throw unavailable('Public media');
+    return { bytes, contentType: item.contentType };
+  } catch (error) { if (error instanceof AppError) throw error; throw unavailable('Public media'); }
 }
 export async function revokeMedia(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
   const { reason } = z.strictObject({ reason: reasonSchema }).parse(body);

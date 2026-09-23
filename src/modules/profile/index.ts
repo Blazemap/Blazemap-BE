@@ -1,1 +1,1 @@
-export { saveAvatar, readAvatar } from './profile.service.js';
+export { saveAvatar, readAvatar, readAdminAvatar, saveAdminAvatar } from './profile.service.js';

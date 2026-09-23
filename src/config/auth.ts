@@ -3,8 +3,8 @@ import { prismaAdapter } from 'better-auth/adapters/prisma';
 import { APIError } from 'better-auth/api';
 import { customSession } from 'better-auth/plugins';
 import { effectiveCapabilities } from '../modules/admin/rules.js';
-import nodemailer from 'nodemailer';
 import { db } from './db.js';
+import { sendEmail } from './email.js';
 import type { PrismaClient } from '../generated/prisma/client.js';
 import { emailAvailable, env, googleAvailable, origins } from './env.js';
 import { unavailable } from '../utils/index.js';
@@ -27,15 +27,9 @@ export const privilegeFields = {
   canConfirmIncidents: { type: 'boolean', required: false, defaultValue: false, input: false },
   canPublishInformation: { type: 'boolean', required: false, defaultValue: false, input: false },
 } as const;
-const mail = emailAvailable ? nodemailer.createTransport({
-  host: env.SMTP_HOST, port: Number(env.SMTP_PORT), secure: env.SMTP_SECURE === 'true',
-  requireTLS: env.SMTP_SECURE !== 'true',
-  auth: env.SMTP_USER ? { user: env.SMTP_USER, pass: env.SMTP_PASSWORD } : undefined,
-  connectionTimeout: 10000, socketTimeout: 15000, logger: false, debug: false,
-}) : null;
 async function send(to: string, subject: string, url: string) {
-  if (!mail) throw new APIError('SERVICE_UNAVAILABLE', { message: 'Email delivery unavailable' });
-  try { await mail.sendMail({ from: env.SMTP_FROM, to, subject, text: `${subject}\n\n${url}\n\nIf you did not request this, ignore this email.` }); }
+  if (!emailAvailable) throw new APIError('SERVICE_UNAVAILABLE', { message: 'Email delivery unavailable' });
+  try { await sendEmail(to, subject, `${subject}\n\n${url}\n\nIf you did not request this, ignore this email.`); }
   catch { throw new APIError('SERVICE_UNAVAILABLE', { message: 'Email delivery unavailable' }); }
 }
 export function createAuth(client: PrismaClient = db()) {

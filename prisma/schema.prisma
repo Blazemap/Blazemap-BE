@@ -48,6 +48,7 @@ enum HandlingStatus {
   CLOSED
 }
 enum Priority {
+  CRITICAL
   HIGH
   MEDIUM
   LOW
@@ -109,6 +110,11 @@ enum FieldFinding {
   INCONCLUSIVE
   UNREACHABLE
 }
+enum ObservationProvenance {
+  FIELD_OBSERVATION
+  REVIEWED_CITIZEN_ESTIMATE
+  OPERATOR_ASSESSMENT
+}
 enum UpdateKind {
   CLARIFICATION
   REQUEST
@@ -158,6 +164,19 @@ model MsUser {
   publications TrPublicInformation[] @relation("publisher")
   audits TrAuditLog[]
   notifications TrNotification[]
+  nearbyLocation TrUserLocation?
+}
+model TrUserLocation {
+  userId String @id
+  user MsUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  latitude Float
+  longitude Float
+  accuracyMeters Float
+  capturedAt DateTime @db.Timestamptz(3)
+  consentAt DateTime @db.Timestamptz(3)
+  emailEnabled Boolean @default(false)
+  expiresAt DateTime @db.Timestamptz(3)
+  @@index([expiresAt])
 }
 model TrSession {
   id String @id
@@ -222,6 +241,7 @@ model TrReport {
   publications TrPublicInformation[]
   updates TrReportUpdate[]
   progress TrReportProgress[]
+  reviewedObservations TrFieldUpdate[] @relation("observationSourceReport")
   attachments TrAttachment[]
   notifications TrNotification[]
   @@unique([reporterId, idempotencyKey])
@@ -276,10 +296,7 @@ model TrHotspot {
   version String?
   raw Json
   fetchedAt DateTime @default(now()) @db.Timestamptz(3)
-  caseId String?
-  case TrCase? @relation(fields: [caseId], references: [id], onDelete: Restrict)
   @@index([acquiredAt])
-  @@index([caseId])
 }
 model TrCase {
   id String @id @default(cuid())
@@ -307,14 +324,17 @@ model TrCase {
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
   closedAt DateTime? @db.Timestamptz(3)
   closureReason String?
+  completionFieldUpdateId String?
+  completionFieldUpdate TrFieldUpdate? @relation("caseCompletionEvidence", fields: [completionFieldUpdateId], references: [id], onDelete: Restrict)
   reports TrReport[]
-  hotspots TrHotspot[]
   fieldUpdates TrFieldUpdate[]
   verifications TrVerification[]
   assignments TrAssignment[]
   analyses TrAnalysis[] @relation("caseAnalyses")
   publications TrPublicInformation[]
+  notifications TrNotification[]
   @@index([regionId])
+  @@index([completionFieldUpdateId])
   @@index([handlingStatus, priority, updatedAt])
 }
 model TrFieldUpdate {
@@ -325,18 +345,26 @@ model TrFieldUpdate {
   recorder MsUser @relation(fields: [recorderId], references: [id], onDelete: Restrict)
   teamId String?
   team MsTeam? @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  assignmentId String?
+  assignment TrAssignment? @relation(fields: [assignmentId], references: [id], onDelete: Restrict)
   findings FieldFinding
   description String
   source String
+  provenance ObservationProvenance @default(FIELD_OBSERVATION)
+  sourceReportId String?
+  sourceReport TrReport? @relation("observationSourceReport", fields: [sourceReportId], references: [id], onDelete: Restrict)
   observedAt DateTime @db.Timestamptz(3)
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   latitude Float?
   longitude Float?
   attachments TrAttachment[]
   verifications TrVerification[]
+  completedCases TrCase[] @relation("caseCompletionEvidence")
   @@index([caseId, observedAt])
   @@index([recorderId])
   @@index([teamId])
+  @@index([assignmentId])
+  @@index([sourceReportId])
 }
 model TrVerification {
   id String @id @default(cuid())
@@ -520,8 +548,13 @@ model TrAssignment {
   version Int @default(1)
   idempotencyKey String? @unique
   payloadHash String?
+  acceptedAt DateTime? @db.Timestamptz(3)
+  startedAt DateTime? @db.Timestamptz(3)
+  completedAt DateTime? @db.Timestamptz(3)
+  cancelledAt DateTime? @db.Timestamptz(3)
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  fieldUpdates TrFieldUpdate[]
   @@index([caseId, status])
   @@index([teamId])
   @@index([assigningAdminId])
@@ -576,6 +609,8 @@ model TrPublicInformation {
   title String
   summary String
   body String
+  bodyRich Json?
+  caseDraftKey String? @unique
   type PublicationType
   outcome PublicationOutcome?
   reportId String?
@@ -604,6 +639,7 @@ model TrPublicInformation {
   privacyReview String?
   regions TrPublicInformationRegion[]
   attachments TrAttachment[]
+  notifications TrNotification[]
   @@index([reportId])
   @@index([status, type, publishedAt])
   @@index([caseId])
@@ -635,16 +671,26 @@ model TrNotification {
   id String @id @default(cuid())
   userId String
   user MsUser @relation(fields: [userId], references: [id], onDelete: Cascade)
-  reportId String
-  report TrReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  reportId String?
+  report TrReport? @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  publicationId String?
+  publication TrPublicInformation? @relation(fields: [publicationId], references: [id], onDelete: Cascade)
+  caseId String?
+  case TrCase? @relation(fields: [caseId], references: [id], onDelete: Cascade)
   eventKey String @unique
   type String
   title String
   message String
   createdAt DateTime @default(now()) @db.Timestamptz(3)
   readAt DateTime? @db.Timestamptz(3)
+  emailRequested Boolean @default(false)
+  emailSentAt DateTime? @db.Timestamptz(3)
+  emailClaimedAt DateTime? @db.Timestamptz(3)
+  emailAttempts Int @default(0)
+  lastEmailAttemptAt DateTime? @db.Timestamptz(3)
   @@index([userId, createdAt, id])
   @@index([userId, readAt])
+  @@index([emailRequested, emailSentAt, emailAttempts, emailClaimedAt], map: "TrNotification_email_outbox_idx")
   @@index([reportId])
 }
 model TrIntegrationRun {

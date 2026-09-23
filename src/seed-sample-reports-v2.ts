@@ -22,6 +22,14 @@ export const sampleReportV2Provenance = 'sample-report-v2';
 export const sampleReportV2Notice = 'Illustrative scenario; not verified real incident.';
 export const sampleReportV2Prefix = 'sample-v2-report-';
 const priorPrefix = 'sample-report-v1-';
+const legacyReportId = (index: number) => `sample-v2-report-record-${String(index + 1).padStart(2, '0')}`;
+const legacyAttachmentId = (index: number) => `sample-v2-attachment-${String(index + 1).padStart(2, '0')}`;
+const legacyCaseId = (index: number) => `sample-v2-case-${String(index + 1).padStart(2, '0')}`;
+const legacyFieldId = (index: number) => `sample-v2-field-${String(index + 1).padStart(2, '0')}`;
+const legacyVerificationId = (index: number) => `sample-v2-verification-${String(index + 1).padStart(2, '0')}`;
+const legacyPublicationId = (index: number) => `sample-v2-publication-${String(index + 1).padStart(2, '0')}`;
+const legacyProgressId = (index: number, step: number) => `sample-v2-progress-${String(index + 1).padStart(2, '0')}-${String(step + 1).padStart(2, '0')}`;
+const legacyProgressKey = (index: number, step: number) => `sample-v2-progress-key-${String(index + 1).padStart(2, '0')}-${String(step + 1).padStart(2, '0')}`;
 const priorReportActor = 'sample-report-seeder';
 const priorImageActor = 'sample-report-image-seeder-v2';
 const replacementTarget = 'sample-report-v2-batch';
@@ -55,9 +63,16 @@ const sites = [
 ] as const;
 
 const owners = [0, 0, 1, 1, 2, 2, 3, 3, 4, 5] as const;
+const fixtureId = (kind: string, index: number, step = 0) => {
+  const bytes = createHash('sha1').update(`blazemap:sample-report-v2:${kind}:${index}:${step}`).digest();
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const value = bytes.subarray(0, 16).toString('hex');
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+};
 const caseDefinitions = [
   {
-    id: 'sample-v2-case-01',
+    id: fixtureId('case', 0),
     number: 'C-20000000-0000-4000-8000-000000000001',
     reportIndex: 7,
     title: 'Katingan Fire Response Exercise',
@@ -66,7 +81,7 @@ const caseDefinitions = [
     perimeter: { type: 'Polygon' as const, coordinates: [[[113.268, -1.812], [113.284, -1.808], [113.291, -1.817], [113.282, -1.821], [113.288, -1.832], [113.271, -1.835], [113.264, -1.824], [113.268, -1.812]]] },
   },
   {
-    id: 'sample-v2-case-02',
+    id: fixtureId('case', 1),
     number: 'C-20000000-0000-4000-8000-000000000002',
     reportIndex: 9,
     title: 'Kapuas Fire Response Exercise',
@@ -79,13 +94,13 @@ const caseDefinitions = [
 const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 function requireSafe(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message); }
 const uuid = (index: number) => `20000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
-const reportId = (index: number) => `sample-v2-report-record-${String(index + 1).padStart(2, '0')}`;
-const attachmentId = (index: number) => `sample-v2-attachment-${String(index + 1).padStart(2, '0')}`;
-const fieldId = (index: number) => `sample-v2-field-${String(index + 1).padStart(2, '0')}`;
-const verificationId = (index: number) => `sample-v2-verification-${String(index + 1).padStart(2, '0')}`;
-const publicationId = (index: number) => `sample-v2-publication-${String(index + 1).padStart(2, '0')}`;
-const progressId = (reportIndex: number, step: number) => `sample-v2-progress-${String(reportIndex + 1).padStart(2, '0')}-${String(step + 1).padStart(2, '0')}`;
-const progressKey = (reportIndex: number, step: number) => `sample-v2-progress-key-${String(reportIndex + 1).padStart(2, '0')}-${String(step + 1).padStart(2, '0')}`;
+const reportId = (index: number) => fixtureId('report', index);
+const attachmentId = (index: number) => fixtureId('attachment', index);
+const fieldId = (index: number) => fixtureId('field', index);
+const verificationId = (index: number) => fixtureId('verification', index);
+const publicationId = (index: number) => fixtureId('publication', index);
+const progressId = (reportIndex: number, step: number) => fixtureId('progress', reportIndex, step);
+const progressKey = (reportIndex: number, step: number) => fixtureId('progress-key', reportIndex, step);
 const iso = (value: Date) => value.toISOString();
 
 export function trustedPhotoUrl(value: string) {
@@ -94,10 +109,20 @@ export function trustedPhotoUrl(value: string) {
   return url;
 }
 
-export function sampleReportV2Flags(args: string[]) {
-  const { values } = parseArgs({ args, options: { apply: { type: 'boolean', default: false }, 'replace-sample-reports': { type: 'boolean', default: false } }, allowPositionals: false });
-  if (!!values.apply !== !!values['replace-sample-reports']) throw new Error('Apply requires both write flags');
-  return !!values.apply;
+export function sampleReportV2Flags(args: string[], nodeEnv = process.env.NODE_ENV) {
+  const { values } = parseArgs({ args, options: { apply: { type: 'boolean', default: false }, 'replace-sample-reports': { type: 'boolean', default: false }, 'migrate-legacy-ids': { type: 'boolean', default: false }, 'confirm-current-database': { type: 'string' } }, allowPositionals: false });
+  const migrateLegacyIds = !!values['migrate-legacy-ids'];
+  const apply = !!values.apply;
+  if (migrateLegacyIds) {
+    requireSafe(!values['replace-sample-reports'], 'Migration cannot be combined with replacement');
+    requireSafe(nodeEnv === 'development' || nodeEnv === 'test', 'Legacy migration preflight requires development or test');
+    requireSafe(!values['confirm-current-database'] || apply, 'Database confirmation requires apply');
+    requireSafe(!apply, 'Legacy ID migration writes are not implemented; no changes were made');
+    return { apply: false, migrateLegacyIds: true };
+  }
+  requireSafe(!values['confirm-current-database'], 'Database confirmation is only for legacy migration');
+  if (apply !== !!values['replace-sample-reports']) throw new Error('Apply requires both write flags');
+  return { apply, migrateLegacyIds: false };
 }
 
 function progressDescription(stage: string) {
@@ -113,13 +138,13 @@ function progressDescription(stage: string) {
   return `${descriptions[stage] ?? 'The report workflow was updated.'} ${sampleReportV2Notice}`;
 }
 
-export function sampleReportV2Plan(now = new Date()) {
+export function sampleReportV2Plan(now = new Date(), legacyIds = false) {
   const citizens = testIdentities.filter(identity => identity.role === 'USER');
   const reports = sites.map((site, index) => {
     const observedAt = new Date(now.getTime() - (20 + index * 17) * 60000);
     const createdAt = new Date(observedAt.getTime() + 60000);
     const key = `${sampleReportV2Prefix}${String(index + 1).padStart(2, '0')}`;
-    const attachment = attachmentId(index);
+    const attachment = legacyIds ? legacyAttachmentId(index) : attachmentId(index);
     const payload = reportSchema.parse({
       observationTypes: [...site.types],
       observedAt: iso(observedAt),
@@ -134,16 +159,16 @@ export function sampleReportV2Plan(now = new Date()) {
       idempotencyKey: key,
     });
     return {
-      id: reportId(index),
+      id: legacyIds ? legacyReportId(index) : reportId(index),
       number: `R-${uuid(index + 1)}`,
       email: citizens[owners[index]!]!.email,
       place: site.place,
       reviewStatus: site.status,
-      caseId: 'caseIndex' in site ? caseDefinitions[site.caseIndex].id : null,
+      caseId: 'caseIndex' in site ? legacyIds ? legacyCaseId(site.caseIndex) : caseDefinitions[site.caseIndex].id : null,
       createdAt,
       payload,
       payloadHash: fingerprint({ ...payload, observationTypes: [...payload.observationTypes].sort(), attachmentIds: [...payload.attachmentIds].sort() }),
-      progress: site.progress.map((stage, step) => ({ id: progressId(index, step), idempotencyKey: progressKey(index, step), stage, description: progressDescription(stage), createdAt: new Date(createdAt.getTime() + (step + 1) * 60000) })),
+      progress: site.progress.map((stage, step) => ({ id: legacyIds ? legacyProgressId(index, step) : progressId(index, step), idempotencyKey: legacyIds ? legacyProgressKey(index, step) : progressKey(index, step), stage, description: progressDescription(stage), createdAt: new Date(createdAt.getTime() + (step + 1) * 60000) })),
       source: photoSources[index]!,
       attachmentId: attachment,
     };
@@ -153,7 +178,7 @@ export function sampleReportV2Plan(now = new Date()) {
     const observedAt = new Date(report.createdAt.getTime() + 180000);
     const closedAt = definition.handlingStatus === 'CLOSED' ? new Date(now.getTime() - 180000) : null;
     const publication = {
-      id: publicationId(index),
+      id: legacyIds ? legacyPublicationId(index) : publicationId(index),
       slug: index === 0 ? 'katingan-fire-response-exercise-2026' : 'kapuas-fire-response-exercise-2026',
       title: definition.title,
       summary: `${sampleReportV2Notice} This exercise record demonstrates a reviewed response perimeter and status history.`,
@@ -164,6 +189,7 @@ export function sampleReportV2Plan(now = new Date()) {
     };
     return {
       ...definition,
+      id: legacyIds ? legacyCaseId(index) : definition.id,
       perimeter: polygonSchema.parse(definition.perimeter),
       latitude: report.payload.latitude!,
       longitude: report.payload.longitude!,
@@ -171,8 +197,8 @@ export function sampleReportV2Plan(now = new Date()) {
       openedAt: new Date(report.createdAt.getTime() + 120000),
       closedAt,
       closureReason: closedAt ? `Exercise workflow completed. ${sampleReportV2Notice}` : null,
-      fieldId: fieldId(index),
-      verificationId: verificationId(index),
+      fieldId: legacyIds ? legacyFieldId(index) : fieldId(index),
+      verificationId: legacyIds ? legacyVerificationId(index) : verificationId(index),
       publication,
     };
   });
@@ -323,7 +349,7 @@ async function protectedTables(client: PrismaClient | Prisma.TransactionClient, 
 
 async function preservationSnapshot(client: PrismaClient | Prisma.TransactionClient, excludedCaseIds: string[], excluded: Record<string, string[]>) {
   const genuineReports = await client.trReport.findMany({ where: { NOT: [{ idempotencyKey: { startsWith: priorPrefix } }, { idempotencyKey: { startsWith: sampleReportV2Prefix } }] }, include: { attachments: { orderBy: { id: 'asc' } }, progress: { orderBy: { id: 'asc' } }, updates: { orderBy: { id: 'asc' } }, publications: { orderBy: { id: 'asc' } } }, orderBy: { id: 'asc' }, take: 1001 });
-  const protectedCases = await client.trCase.findMany({ where: { id: { notIn: [...excludedCaseIds, ...caseDefinitions.map(item => item.id)] } }, include: { reports: { select: { id: true }, orderBy: { id: 'asc' } }, hotspots: { select: { id: true }, orderBy: { id: 'asc' } }, fieldUpdates: { select: { id: true }, orderBy: { id: 'asc' } }, verifications: { select: { id: true }, orderBy: { id: 'asc' } }, assignments: { select: { id: true }, orderBy: { id: 'asc' } }, analyses: { select: { id: true }, orderBy: { id: 'asc' } }, publications: { select: { id: true }, orderBy: { id: 'asc' } } }, orderBy: { id: 'asc' }, take: 1001 });
+  const protectedCases = await client.trCase.findMany({ where: { id: { notIn: [...excludedCaseIds, ...caseDefinitions.map(item => item.id)] } }, include: { reports: { select: { id: true }, orderBy: { id: 'asc' } }, fieldUpdates: { select: { id: true }, orderBy: { id: 'asc' } }, verifications: { select: { id: true }, orderBy: { id: 'asc' } }, assignments: { select: { id: true }, orderBy: { id: 'asc' } }, analyses: { select: { id: true }, orderBy: { id: 'asc' } }, publications: { select: { id: true }, orderBy: { id: 'asc' } } }, orderBy: { id: 'asc' }, take: 1001 });
   requireSafe(genuineReports.length <= 1000 && protectedCases.length <= 1000, 'Preservation bound exceeded');
   const [firms] = await client.$queryRaw<{ hotspots: bigint; hotspotHash: string; runs: bigint; runHash: string }[]>`
     SELECT
@@ -375,10 +401,10 @@ async function priorSurface(client: PrismaClient | Prisma.TransactionClient) {
   const notifications = await client.trNotification.findMany({ where: { reportId: { in: reportIds } }, select: { id: true }, take: 2 });
   requireSafe(!notifications.length, 'Prior reports have notifications that require manual review');
   const caseIds = [...new Set(reports.flatMap(report => report.caseId ? [report.caseId] : []))];
-  const cases = await client.trCase.findMany({ where: { id: { in: caseIds } }, include: { reports: { select: { id: true, number: true } }, hotspots: { select: { id: true } }, fieldUpdates: { select: { id: true } }, verifications: { select: { id: true } }, assignments: { select: { id: true } }, analyses: { select: { id: true } }, publications: { select: { id: true } } }, orderBy: { id: 'asc' } });
+  const cases = await client.trCase.findMany({ where: { id: { in: caseIds } }, include: { reports: { select: { id: true, number: true } }, fieldUpdates: { select: { id: true } }, verifications: { select: { id: true } }, assignments: { select: { id: true } }, analyses: { select: { id: true } }, publications: { select: { id: true } } }, orderBy: { id: 'asc' } });
   requireSafe(cases.length === caseIds.length, 'Prior linked case missing');
   for (const item of cases) {
-    requireSafe(item.reports.length > 0 && item.reports.every(report => reportIds.includes(report.id)) && item.title === `Reported observation ${item.reports[0]!.number}` && item.verificationStatus === 'UNVERIFIED' && item.perimeter === null && item.latestAnalysisId === null && !item.hotspots.length && !item.fieldUpdates.length && !item.verifications.length && !item.assignments.length && !item.analyses.length && !item.publications.length, 'Prior linked case is not isolated to sample reports');
+    requireSafe(item.reports.length > 0 && item.reports.every(report => reportIds.includes(report.id)) && item.title === `Reported observation ${item.reports[0]!.number}` && item.verificationStatus === 'UNVERIFIED' && item.perimeter === null && item.latestAnalysisId === null && !item.fieldUpdates.length && !item.verifications.length && !item.assignments.length && !item.analyses.length && !item.publications.length, 'Prior linked case is not isolated to sample reports');
     const audits = await client.trAuditLog.findMany({ where: { targetType: 'CASE', targetId: item.id }, select: { action: true, details: true }, take: 11 });
     requireSafe(audits.length <= 10 && audits.every(audit => ['CASE_CREATED', 'REPORT_LINKED', 'REPORT_REVIEW_STARTED'].includes(audit.action) && (!audit.details || reportIds.some(id => JSON.stringify(audit.details).includes(id)))), 'Prior linked case audit mismatch');
   }
@@ -482,6 +508,44 @@ function batchDetails(value: unknown) {
   return { baseTime: new Date(details.baseTime), oldObjectKeys: details.oldObjectKeys as string[] };
 }
 
+export function sampleReportV2IdMapping(baseTime: Date) {
+  const legacy = sampleReportV2Plan(baseTime, true);
+  const current = sampleReportV2Plan(baseTime);
+  const pairs = [
+    ...legacy.reports.flatMap((report, index) => [
+      [report.id, current.reports[index]!.id],
+      [report.attachmentId, current.reports[index]!.attachmentId],
+      ...report.progress.flatMap((progress, step) => [[progress.id, current.reports[index]!.progress[step]!.id], [progress.idempotencyKey, current.reports[index]!.progress[step]!.idempotencyKey]]),
+    ]),
+    ...legacy.cases.flatMap((item, index) => [[item.id, current.cases[index]!.id], [item.fieldId, current.cases[index]!.fieldId], [item.verificationId, current.cases[index]!.verificationId], [item.publication.id, current.cases[index]!.publication.id]]),
+  ];
+  requireSafe(new Set(pairs.map(pair => pair[0])).size === pairs.length && new Set(pairs.map(pair => pair[1])).size === pairs.length, 'Fixture ID mapping collision');
+  return pairs.map(([from, to]) => ({ from: from!, to: to! }));
+}
+
+export async function preflightSampleReportV2LegacyIds(client: PrismaClient) {
+  const batches = await client.trAuditLog.findMany({ where: { systemActor: sampleReportV2Provenance, action: replacementAction, targetType: 'SEED_BATCH', targetId: replacementTarget }, select: { details: true }, take: 2 });
+  requireSafe(batches.length === 1, 'Expected exactly one v2 replacement batch');
+  const details = batchDetails(batches[0]!.details);
+  requireSafe(!Number.isNaN(details.baseTime.getTime()), 'Replacement batch baseTime invalid');
+  const legacy = sampleReportV2Plan(details.baseTime, true);
+  const current = sampleReportV2Plan(details.baseTime);
+  const batch = batches[0]!.details as Record<string, unknown>;
+  requireSafe(isDeepStrictEqual(batch.newReportIds, legacy.reports.map(item => item.id)) && isDeepStrictEqual(batch.newCaseIds, legacy.cases.map(item => item.id)) && isDeepStrictEqual(batch.newPublicationIds, legacy.cases.map(item => item.publication.id)), 'Replacement batch IDs do not match legacy fixture');
+  await verifyDatabaseV2(client, legacy);
+  const reports = await client.trReport.findMany({ where: { id: { in: current.reports.map(item => item.id) } }, select: { id: true }, take: 1 });
+  const [attachments, progress, cases, fields, verifications, publications] = await Promise.all([
+    client.trAttachment.count({ where: { id: { in: current.reports.map(item => item.attachmentId) } } }),
+    client.trReportProgress.count({ where: { OR: [{ id: { in: current.reports.flatMap(item => item.progress.map(row => row.id)) } }, { idempotencyKey: { in: current.reports.flatMap(item => item.progress.map(row => row.idempotencyKey)) } }] } }),
+    client.trCase.count({ where: { id: { in: current.cases.map(item => item.id) } } }),
+    client.trFieldUpdate.count({ where: { id: { in: current.cases.map(item => item.fieldId) } } }),
+    client.trVerification.count({ where: { id: { in: current.cases.map(item => item.verificationId) } } }),
+    client.trPublicInformation.count({ where: { id: { in: current.cases.map(item => item.publication.id) } } }),
+  ]);
+  requireSafe(!reports.length && !attachments && !progress && !cases && !fields && !verifications && !publications, 'Deterministic UUID collision or partial migration detected');
+  return { mode: 'DRY_RUN_LEGACY_ID_MIGRATION_PREFLIGHT', writes: 0, baseTime: iso(details.baseTime), mapping: sampleReportV2IdMapping(details.baseTime), limitation: 'Read-only preflight only. Foreign-key and JSON references have not been exhaustively checked; migration writes are disabled.' };
+}
+
 export async function seedSampleReportsV2(client: PrismaClient, apply = false, requestedNow = new Date()) {
   const batch = await client.trAuditLog.findFirst({ where: { systemActor: sampleReportV2Provenance, action: replacementAction, targetType: 'SEED_BATCH', targetId: replacementTarget }, select: { details: true }, orderBy: { createdAt: 'desc' } });
   const existingV2 = await client.trReport.count({ where: { idempotencyKey: { startsWith: sampleReportV2Prefix } } });
@@ -489,13 +553,16 @@ export async function seedSampleReportsV2(client: PrismaClient, apply = false, r
     requireSafe(existingV2 === 10 && batch, 'Partial v2 replacement detected');
     const details = batchDetails(batch.details);
     const plan = sampleReportV2Plan(details.baseTime);
-    const verified = await verifyDatabaseV2(client, plan);
+    const currentIds = await client.trReport.findMany({ where: { idempotencyKey: { startsWith: sampleReportV2Prefix } }, select: { id: true }, orderBy: { idempotencyKey: 'asc' }, take: 11 });
+    const legacy = currentIds.every((row, index) => row.id === legacyReportId(index));
+    const verified = await verifyDatabaseV2(client, legacy ? sampleReportV2Plan(details.baseTime, true) : plan);
+    if (legacy && apply) throw new Error('Legacy sample IDs require the explicit UUID migration workflow; no changes were made.');
     await verifyObjectsFromDatabase(client, verified.reports);
     const users = await fixtureUsers(client);
     const citizen = users.find(user => user.role === 'USER')! as typeof users[number] & { role: 'USER' };
-    const publicVisibility = await verifyPublicV2(client, plan, citizen);
+    const publicVisibility = await verifyPublicV2(client, legacy ? sampleReportV2Plan(details.baseTime, true) : plan, citizen);
     const oldObjectsDeleted = apply ? await deleteOldObjects(details.oldObjectKeys) : 0;
-    return { mode: apply ? 'VERIFIED' : 'DRY_RUN_EXISTING', provenance: sampleReportV2Provenance, created: { reports: 0, attachments: 0, progress: 0, cases: 0, fields: 0, verifications: 0, publications: 0 }, deleted: { reports: 0, attachments: 0, progress: 0, updates: 0, cases: 0 }, existing: { reports: 10, cases: 2, publications: 2 }, objects: { signedImagesVerified: 10, oldObjectsDeleted }, workflow: verified.workflow, publicVisibility, limitations: ['Images are public-domain references, not location evidence.', 'Confirmed cases and publications are clearly labelled training exercises.', 'No operational alert or citizen notification was created.'] };
+    return { mode: apply ? 'VERIFIED' : legacy ? 'DRY_RUN_LEGACY_IDS' : 'DRY_RUN_EXISTING', provenance: sampleReportV2Provenance, created: { reports: 0, attachments: 0, progress: 0, cases: 0, fields: 0, verifications: 0, publications: 0 }, deleted: { reports: 0, attachments: 0, progress: 0, updates: 0, cases: 0 }, existing: { reports: 10, cases: 2, publications: 2 }, objects: { signedImagesVerified: 10, oldObjectsDeleted }, workflow: verified.workflow, publicVisibility, limitations: ['Images are public-domain references, not location evidence.', 'Confirmed cases and publications are clearly labelled training exercises.', 'No operational alert or citizen notification was created.'] };
   }
 
   const prior = await priorSurface(client);
@@ -649,10 +716,11 @@ export async function seedSampleReportsV2(client: PrismaClient, apply = false, r
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
-    const result = await seedSampleReportsV2(db(), sampleReportV2Flags(process.argv.slice(2)));
+    const flags = sampleReportV2Flags(process.argv.slice(2));
+    const result = flags.migrateLegacyIds ? await preflightSampleReportV2LegacyIds(db()) : await seedSampleReportsV2(db(), flags.apply);
     console.log(JSON.stringify(result));
   } catch (error) {
-    console.error(JSON.stringify({ failed: true, category: error instanceof Error ? error.name : 'Unknown', message: 'Sample report v2 replacement stopped. No credentials were logged. If the database replacement committed before object cleanup failed, rerun the same command to finish verified cleanup.' }));
+    console.error(JSON.stringify({ failed: true, category: error instanceof Error ? error.name : 'Unknown', message: process.argv.includes('--migrate-legacy-ids') ? 'Legacy ID migration preflight stopped. Migration writes are disabled; no changes were made.' : 'Sample report v2 replacement stopped. No credentials were logged. If the database replacement committed before object cleanup failed, rerun the same command to finish verified cleanup.' }));
     process.exitCode = 1;
   } finally {
     await disconnect();

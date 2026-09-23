@@ -4,27 +4,32 @@ import type { Prisma, PrismaClient } from '../../generated/prisma/client.js';
 import { db, env } from '../../config/index.js';
 import { warningSnapshotSchema, publicationSchema, publishSchema, outcomePublicationSchema, withdrawalSchema, settingsSchema, informationQuerySchema, type Actor, type Transaction } from '../../types/index.js';
 import { AppError, jsonValue, fingerprint } from '../../utils/index.js';
+import { richTextDocumentSchema } from '../../utils/rich-text.js';
 import { areaHectares, publicPerimeter, publicPerimeterSchema } from '../../utils/geometry.js';
 import { audit, lockedActor, verifiedRegion } from './access.js';
 import { assertPublicationRevision, nextPublicationTimestamp, publicPoint } from './rules.js';
-import { loadWindContext, windContextSchema } from '../integrations/wind.js';
 
 const publicStatuses = ['PUBLISHED', 'SUPERSEDED', 'WITHDRAWN'] as const;
+export function assertActiveCasePublication(value: { handlingStatus: string; verificationStatus: string }) {
+  if (value.handlingStatus === 'CLOSED') throw new AppError('Use the completion News workflow for closed cases', 409, 'COMPLETION_NEWS_REQUIRED');
+  if (value.verificationStatus !== 'CONFIRMED_FIRE') throw new AppError('Confirm the case before preparing a public incident update', 409, 'CASE_NOT_CONFIRMED');
+}
 const publicLinkSchema = z.object({ id: z.string().min(1), slug: z.string().min(1), status: z.enum(publicStatuses), publishedAt: z.date() });
-const publicCaseContextSchema = z.object({ number: z.string().min(1), handlingStatus: z.enum(['OPEN', 'CHECK_SCHEDULED', 'ON_SCENE', 'RESPONDING', 'MONITORING', 'CLOSED']), windContext: windContextSchema.optional() });
-export function publicationSelect(now = new Date()) {
+const publicCaseContextSchema = z.object({ number: z.string().min(1), handlingStatus: z.enum(['OPEN', 'CHECK_SCHEDULED', 'ON_SCENE', 'RESPONDING', 'MONITORING', 'CLOSED']) });
+export function publicationSelect(now = new Date(), coverOnly = false) {
   return {
-    id: true, slug: true, title: true, summary: true, body: true, type: true, outcome: true, status: true, sources: true, publishedAt: true, updatedAt: true, validUntil: true,
+    id: true, slug: true, title: true, summary: true, body: true, bodyRich: true, type: true, outcome: true, status: true, sources: true, publishedAt: true, updatedAt: true, validUntil: true,
     authorityReference: true, withdrawalReason: true, supersedesId: true,
     publicLocationMode: true, publicLatitude: true, publicLongitude: true, publicCaseSnapshot: true,
     supersedes: { select: { id: true, slug: true, status: true, publishedAt: true } },
-    attachments: { where: { approvedAt: { not: null }, revokedAt: null }, select: { id: true, filename: true, contentType: true, size: true } },
+    attachments: { where: { approvedAt: { not: null }, approvedById: { not: null }, sourceAttachmentId: { not: null }, revokedAt: null }, select: { id: true, filename: true, contentType: true, size: true }, orderBy: [{ approvedAt: 'asc' as const }, { id: 'asc' as const }], ...(coverOnly ? { take: 1 } : {}) },
     regions: { select: { region: { select: { id: true, name: true, timezone: true } } } },
     replacements: { where: { status: { in: [...publicStatuses] }, publishedAt: { lte: now } }, select: { id: true, slug: true, status: true, publishedAt: true }, orderBy: { publishedAt: 'desc' } },
   } satisfies Prisma.TrPublicInformationSelect;
 }
 export function publicationDto<T extends { regions: { region: unknown }[]; validUntil: Date | null; replacements?: unknown[] | null; supersedes?: unknown; supersedesId?: string | null; publicLocationMode?: string; publicLatitude?: number | null; publicLongitude?: number | null; publicCaseSnapshot?: unknown }>(item: T) {
   const { supersedes, replacements, publicCaseSnapshot, ...fields } = item;
+  const bodyRich = 'bodyRich' in fields && fields.bodyRich ? richTextDocumentSchema.safeParse(fields.bodyRich) : null;
   const location = { publicLocationMode: item.publicLocationMode ?? 'NONE', publicLatitude: item.publicLatitude ?? null, publicLongitude: item.publicLongitude ?? null, publicCaseSnapshot };
   const point = publicPoint(location);
   const now = new Date();
@@ -32,7 +37,7 @@ export function publicationDto<T extends { regions: { region: unknown }[]; valid
   const context = publicCaseContextSchema.safeParse(publicCaseSnapshot);
   const advisory = warningSnapshotSchema.safeParse(publicCaseSnapshot);
   return {
-    ...fields, ...(advisory.success ? { advisory: advisory.data } : {}), publicLatitude: point.latitude, publicLongitude: point.longitude, ...point, ...publicPerimeter(location), ...(context.success ? { caseNumber: context.data.number, handlingStatus: context.data.handlingStatus, windContext: context.data.windContext ?? null } : {}), regions: item.regions.map(v => v.region), expired: !!item.validUntil && item.validUntil <= now,
+    ...fields, bodyRich: bodyRich?.success ? bodyRich.data : null, ...(advisory.success ? { advisory: advisory.data } : {}), publicLatitude: point.latitude, publicLongitude: point.longitude, ...point, ...publicPerimeter(location), ...(context.success ? { caseNumber: context.data.number, handlingStatus: context.data.handlingStatus, windContext: null } : {}), regions: item.regions.map(v => v.region), expired: !!item.validUntil && item.validUntil <= now,
     supersedesId: parent.success && parent.data.publishedAt <= now ? parent.data.id : null,
     replacements: (replacements ?? []).flatMap(value => {
       const link = publicLinkSchema.safeParse(value);
@@ -57,14 +62,15 @@ export async function listInformation(query: unknown, admin = false, client: Pri
     ...(search ? [{ OR: [{ title: { contains: search, mode: 'insensitive' as const } }, { summary: { contains: search, mode: 'insensitive' as const } }] }] : []),
   ];
   const where: Prisma.TrPublicInformationWhereInput = { ...(admin ? {} : { status: 'PUBLISHED', publishedAt: { lte: now } }), type, ...(feed ? { status: 'PUBLISHED', caseId: { not: null }, privacyReview: { not: null }, publishedAt: { lte: now, ...(from ? { gte: new Date(from) } : {}) } } : {}), ...(news ? { status: 'PUBLISHED', publishedAt: { lte: now }, privacyReview: { not: null }, OR: [{ outcome: 'DECLINED' }, { caseId: { not: null }, AND: [{ publicCaseSnapshot: { path: ['verificationStatus'], equals: 'CONFIRMED_FIRE' } }, { publicCaseSnapshot: { path: ['handlingStatus'], equals: 'CLOSED' } }] }] } : {}), ...(regionId ? { regions: { some: { regionId } } } : {}), ...(filters.length ? { AND: filters } : {}) };
-  const [data, total] = await client.$transaction([client.trPublicInformation.findMany({ where, select: publicationSelect(now), orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }], skip: (page - 1) * pageSize, take: pageSize }), client.trPublicInformation.count({ where })]);
+  const [data, total] = await client.$transaction([client.trPublicInformation.findMany({ where, select: publicationSelect(now, !admin), orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }], skip: (page - 1) * pageSize, take: pageSize }), client.trPublicInformation.count({ where })]);
   return { data: data.map(publicationDto), meta: { total, page, pageSize } };
 }
 export async function getInformation(id: string, admin = false, client: PrismaClient = db()) {
   const now = new Date();
-  const item = await client.trPublicInformation.findFirst({ where: admin ? { id } : { slug: id, status: { in: [...publicStatuses] }, publishedAt: { lte: now } }, select: { ...publicationSelect(now), ...(admin ? { caseId: true, publicLocationMode: true, publicLatitude: true, publicLongitude: true, privacyReview: true } : {}) } });
+  const item = await client.trPublicInformation.findFirst({ where: admin ? { id } : { slug: id, status: { in: [...publicStatuses] }, publishedAt: { lte: now } }, select: { ...publicationSelect(now), case: { select: { verificationStatus: true, handlingStatus: true } }, ...(admin ? { caseId: true, publicLocationMode: true, publicLatitude: true, publicLongitude: true, privacyReview: true } : {}) } });
   if (!item) throw new AppError('Information not found', 404, 'NOT_FOUND');
-  return publicationDto(item);
+  const { case: liveCase, ...publication } = item;
+  return { ...publicationDto(publication), activeMapEligible: liveCase?.verificationStatus === 'CONFIRMED_FIRE' && liveCase.handlingStatus !== 'CLOSED' && publicCaseContextSchema.safeParse(publication.publicCaseSnapshot).data?.handlingStatus !== 'CLOSED' };
 }
 async function validateRegions(tx: Transaction, ids: string[]) {
   if (new Set(ids).size !== ids.length) throw new AppError('Duplicate region', 400, 'INVALID_REGION');
@@ -77,6 +83,10 @@ export async function saveInformation(actor: Actor, body: unknown, id?: string, 
     if (id) await tx.$queryRaw`SELECT id FROM "TrPublicInformation" WHERE id = ${id} FOR UPDATE`;
     const old = id ? await tx.trPublicInformation.findUniqueOrThrow({ where: { id }, include: { regions: true } }) : null;
     const input = publicationSchema.parse(old ? { title: old.title, summary: old.summary, body: old.body, type: old.type, outcome: old.outcome, reportId: old.reportId, sources: old.sources, regionIds: old.regions.map(r => r.regionId), caseId: old.caseId, validUntil: old.validUntil?.toISOString() ?? null, publicLocationMode: old.publicLocationMode, publicLatitude: old.publicLatitude, publicLongitude: old.publicLongitude, privacyReview: old.privacyReview, ...patch } : body);
+    if (input.caseId) {
+      await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${input.caseId} FOR UPDATE`;
+      assertActiveCasePublication(await tx.trCase.findUniqueOrThrow({ where: { id: input.caseId }, select: { handlingStatus: true, verificationStatus: true } }));
+    }
     if (input.type === 'WARNING' || old?.type === 'WARNING') throw new AppError('Use the controlled warning workflow', 400, 'WARNING_WORKFLOW_REQUIRED');
     await validateRegions(tx, input.regionIds);
     const { regionIds, validUntil, ...fields } = input;
@@ -94,9 +104,12 @@ export async function saveInformation(actor: Actor, body: unknown, id?: string, 
     return publicationDto(item);
   });
 }
+import { evaluateNearby, notifyNearbyCompletion, lockNearbyWorkflow } from '../notifications/nearby.service.js';
+
 export async function publishInformation(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
   const input = publishSchema.parse(body);
   return client.$transaction(async tx => {
+    await lockNearbyWorkflow(tx);
     await lockedActor(tx, actor, true, 'canPublishInformation');
     await tx.$queryRaw`SELECT id FROM "TrPublicInformation" WHERE id = ${id} FOR UPDATE`;
     const item = await tx.trPublicInformation.findUniqueOrThrow({ where: { id }, include: { regions: true } });
@@ -119,7 +132,8 @@ export async function publishInformation(actor: Actor, id: string, body: unknown
     if (item.publicLocationMode === 'APPROVED_INCIDENT_PERIMETER' && (!item.caseId || !item.privacyReview?.trim())) throw new AppError('Public perimeter needs a case and explicit privacy review', 400, 'PRIVACY_REVIEW_REQUIRED');
     if (item.caseId) {
       await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${item.caseId} FOR UPDATE`;
-      const c = await tx.trCase.findUniqueOrThrow({ where: { id: item.caseId }, include: { region: { select: { id: true, name: true, level: true, bmkgAdm4: true, verifiedAt: true } } } });
+      const c = await tx.trCase.findUniqueOrThrow({ where: { id: item.caseId }, select: { id: true, number: true, verificationStatus: true, handlingStatus: true, version: true, perimeter: true, perimeterObservedAt: true, perimeterSource: true, perimeterRevision: true } });
+      assertActiveCasePublication(c);
       if ((item.outcome === 'CONFIRMED' || item.publicLocationMode === 'APPROVED_INCIDENT_PERIMETER') && input.expectedCaseVersion !== c.version) throw new AppError('Case changed since publication review', 409, 'VERSION_CONFLICT');
       if (item.outcome === 'CONFIRMED' && c.verificationStatus !== 'CONFIRMED_FIRE') throw new AppError('Case is no longer confirmed', 409, 'OUTCOME_CHANGED');
       if (item.outcome === 'CONFIRMED' && c.handlingStatus !== 'CLOSED') throw new AppError('Completed News announcements require a closed case', 409, 'OUTCOME_NOT_COMPLETED');
@@ -130,8 +144,7 @@ export async function publishInformation(actor: Actor, id: string, body: unknown
         if (c.verificationStatus !== 'CONFIRMED_FIRE' || !parsed.success) throw new AppError('A confirmed fire with a valid audited perimeter is required', 409, 'INVALID_PERIMETER');
         publicPerimeter = { ...parsed.data, areaHectares: areaHectares(parsed.data.geometry) };
       }
-      const { windContext } = await loadWindContext(tx, c.region);
-      snapshot = jsonValue({ id: c.id, number: c.number, title: item.title, verificationStatus: c.verificationStatus, handlingStatus: c.handlingStatus, approvedAt: new Date().toISOString(), windContext, ...(publicPerimeter ? { publicPerimeter } : {}) });
+      snapshot = jsonValue({ id: c.id, number: c.number, title: item.title, verificationStatus: c.verificationStatus, handlingStatus: c.handlingStatus, approvedAt: new Date().toISOString(), ...(publicPerimeter ? { publicPerimeter } : {}) });
     }
     if (item.supersedesId) {
       const old = await tx.trPublicInformation.updateMany({ where: { id: item.supersedesId, status: 'PUBLISHED' }, data: { status: 'SUPERSEDED', updatedAt: new Date() } });
@@ -139,8 +152,10 @@ export async function publishInformation(actor: Actor, id: string, body: unknown
     }
     const updated = await tx.trPublicInformation.update({ where: { id, status: 'DRAFT', updatedAt: new Date(input.expectedUpdatedAt) }, data: { status: 'PUBLISHED', publisherId: actor.id, authorityReference: input.authorityReference, updatedAt: nextPublicationTimestamp(item.updatedAt), publishedAt: new Date(), publicCaseSnapshot: snapshot }, select: publicationSelect() });
     await audit(tx, actor.id, 'INFORMATION_PUBLISHED', 'PUBLICATION', id, input.authorityReference, { reviewedUpdatedAt: item.updatedAt.toISOString(), authorityBasis: 'APPLICATION_ADMIN_ROLE', authorityNoteSource: 'OPERATOR_SUPPLIED' });
+    await evaluateNearby(tx, undefined, id);
+    if (item.caseId && item.outcome === 'CONFIRMED') await notifyNearbyCompletion(tx, item.caseId, id, item.summary);
     return publicationDto(updated);
-  });
+  }, { timeout: 30000 });
 }
 export async function publishOutcome(actor: Actor, body: unknown, client: PrismaClient = db()) {
   const input = outcomePublicationSchema.parse(body);
@@ -149,6 +164,7 @@ export async function publishOutcome(actor: Actor, body: unknown, client: Prisma
   const slug = `outcome-${input.idempotencyKey}`;
   const signature = fingerprint(input);
   return client.$transaction(async tx => {
+    await lockNearbyWorkflow(tx);
     await lockedActor(tx, actor, true, 'canPublishInformation');
     const existing = await tx.trPublicInformation.findUnique({ where: { slug }, select: { ...publicationSelect(), authorId: true, privacyReview: true } });
     if (existing) {
@@ -156,45 +172,27 @@ export async function publishOutcome(actor: Actor, body: unknown, client: Prisma
       const { authorId: _authorId, privacyReview: _privacyReview, ...safe } = existing;
       return publicationDto(safe);
     }
-    let snapshot: Prisma.InputJsonValue | undefined;
-    let reference: string;
-    let reportId: string | undefined;
-    let caseId: string | undefined;
-    let expectedCaseVersion: number | undefined;
-    if ('reportId' in input) {
-      reportId = input.reportId;
-      await tx.$queryRaw`SELECT id FROM "TrReport" WHERE id = ${reportId} FOR UPDATE`;
-      const report = await tx.trReport.findUniqueOrThrow({ where: { id: reportId } });
-      if (report.reviewStatus !== 'DECLINED') throw new AppError('Report is no longer declined', 409, 'OUTCOME_CHANGED');
-      reference = report.number;
-    } else {
-      caseId = input.caseId;
-      expectedCaseVersion = input.expectedCaseVersion;
-      await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${caseId} FOR UPDATE`;
-      const c = await tx.trCase.findUniqueOrThrow({ where: { id: caseId }, include: { region: { select: { id: true, name: true, level: true, bmkgAdm4: true, verifiedAt: true } } } });
-      if (c.version !== expectedCaseVersion) throw new AppError('Case changed since review', 409, 'VERSION_CONFLICT');
-      const perimeter = publicPerimeterSchema.omit({ areaHectares: true }).safeParse({ geometry: c.perimeter, observedAt: c.perimeterObservedAt?.toISOString(), source: 'Government-reviewed mapped area', revision: c.perimeterRevision });
-      if (c.verificationStatus !== 'CONFIRMED_FIRE' || !perimeter.success) throw new AppError('Confirmed case with saved perimeter required', 409, 'INVALID_PERIMETER');
-      if (c.handlingStatus !== 'CLOSED') throw new AppError('Completed News announcements require a closed case', 409, 'OUTCOME_NOT_COMPLETED');
-      reference = c.number;
-      const { windContext } = await loadWindContext(tx, c.region);
-      snapshot = jsonValue({ id: c.id, number: c.number, title: 'Confirmed fire update', verificationStatus: c.verificationStatus, handlingStatus: c.handlingStatus, approvedAt: new Date().toISOString(), windContext, publicPerimeter: { ...perimeter.data, areaHectares: areaHectares(perimeter.data.geometry) } });
-    }
+    const reportId = input.reportId;
+    await tx.$queryRaw`SELECT id FROM "TrReport" WHERE id = ${reportId} FOR UPDATE`;
+    const report = await tx.trReport.findUniqueOrThrow({ where: { id: reportId } });
+    if (report.reviewStatus !== 'DECLINED') throw new AppError('Report is no longer declined', 409, 'OUTCOME_CHANGED');
     const now = new Date();
-    const item = await tx.trPublicInformation.create({ data: {
-      slug, title: reportId ? 'Report review: declined' : 'Confirmed fire update', summary: input.message, body: input.message,
-      type: 'UPDATE', outcome: reportId ? 'DECLINED' : 'CONFIRMED', reportId, caseId,
-      status: 'PUBLISHED', authorId: actor.id, publisherId: actor.id, publishedAt: now,
-      sources: [{ title: `System record ${reference}`, url: `${origin}/api/public/information/${slug}` }],
-      privacyReview: signature, publicLocationMode: reportId ? 'NONE' : 'APPROVED_INCIDENT_PERIMETER', publicCaseSnapshot: snapshot,
-    }, select: publicationSelect() });
-    await audit(tx, actor.id, 'OUTCOME_PRIVACY_APPROVED_AND_PUBLISHED', 'PUBLICATION', item.id, undefined, { approvedAt: now.toISOString(), explicitApproval: true, publicText: input.message, perimeterVersion: expectedCaseVersion ?? null, authorityBasis: 'APPLICATION_ADMIN_ROLE' });
+    const publicationData = {
+      slug, title: 'Report review: declined', summary: input.message, body: input.message,
+      type: 'UPDATE', outcome: 'DECLINED', reportId,
+      status: 'PUBLISHED', authorId: actor.id, publisherId: actor.id, publishedAt: now, authorityReference: 'APPLICATION_ADMIN_ROLE',
+      sources: [{ title: `System record ${report.number}`, url: `${origin}/api/public/information/${slug}` }],
+      privacyReview: signature, publicLocationMode: 'NONE',
+    } satisfies Prisma.TrPublicInformationUncheckedCreateInput;
+    const item = await tx.trPublicInformation.create({ data: publicationData, select: publicationSelect() });
+    await audit(tx, actor.id, 'OUTCOME_PRIVACY_APPROVED_AND_PUBLISHED', 'PUBLICATION', item.id, undefined, { approvedAt: now.toISOString(), explicitApproval: true, publicText: input.message, authorityBasis: 'APPLICATION_ADMIN_ROLE' });
     return publicationDto(item);
   });
 }
 export async function withdrawInformation(actor: Actor, id: string, body: unknown) {
   const { reason } = withdrawalSchema.parse(body);
   return db().$transaction(async tx => {
+    await lockNearbyWorkflow(tx);
     await lockedActor(tx, actor, true, 'canPublishInformation');
     const updated = await tx.trPublicInformation.update({ where: { id, status: 'PUBLISHED', type: { not: 'WARNING' } }, data: { status: 'WITHDRAWN', withdrawalReason: reason }, select: publicationSelect() });
     await tx.trAttachment.updateMany({ where: { publicationId: id }, data: { revokedAt: new Date() } });
@@ -209,6 +207,7 @@ export async function getSettings(admin = false) {
 export async function updateSettings(actor: Actor, body: unknown) {
   const input = settingsSchema.parse(body);
   return db().$transaction(async tx => {
+    await lockNearbyWorkflow(tx);
     await lockedActor(tx, actor, true, 'canPublishInformation');
     const data = { ...input, verifiedAt: new Date(input.verifiedAt) };
     await tx.msSiteProfile.upsert({ where: { id: 'site' }, create: { id: 'site', ...data }, update: data });

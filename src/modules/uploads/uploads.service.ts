@@ -82,7 +82,7 @@ export async function finalize(actor: Actor, id: string) {
     throw unavailable('Uploads');
   }
 }
-export async function attach(tx: Transaction, actor: Actor, ids: string[], parent: { reportId: string } | { fieldUpdateId: string } | { reportProgressId: string } | { reportProgressId: string; fieldUpdateId: string }) {
+export async function attach(tx: Transaction, actor: Actor, ids: string[], parent: { reportId: string } | { reportUpdateId: string } | { fieldUpdateId: string } | { reportProgressId: string } | { reportProgressId: string; fieldUpdateId: string }) {
   if (!ids.length) return;
   if (new Set(ids).size !== ids.length) throw new AppError('Duplicate attachment', 400, 'INVALID_ATTACHMENT');
   const count = await tx.trAttachment.updateMany({ where: { id: { in: ids }, uploaderId: actor.id, state: 'READY', expiresAt: { gt: new Date() }, reportId: null, reportUpdateId: null, reportProgressId: null, fieldUpdateId: null, publicationId: null, revokedAt: null }, data: { ...parent, state: 'ATTACHED' } });
@@ -91,14 +91,25 @@ export async function attach(tx: Transaction, actor: Actor, ids: string[], paren
 export async function privateDownloadItem(actor: Actor, id: string, client: PrismaClient = db()) {
   return client.$transaction(async tx => {
     const user = await lockedActor(tx, actor);
-    return tx.trAttachment.findFirst({ where: { id, revokedAt: null, state: { in: ['READY', 'ATTACHED'] }, ...(user.role === 'ADMIN' ? {} : { OR: [{ uploaderId: user.id, reportProgressId: null }, { reportProgress: { report: { reporterId: user.id } } }] }) }, select: { objectKey: true, contentType: true } });
+    return tx.trAttachment.findFirst({ where: { id, revokedAt: null, state: { in: ['READY', 'ATTACHED'] }, ...(user.role === 'ADMIN' ? {} : { OR: [{ uploaderId: user.id, reportId: null, reportProgressId: null, reportUpdateId: null, fieldUpdateId: null, publicationId: null }, { report: { reporterId: user.id } }, { reportProgress: { report: { reporterId: user.id } } }, { reportUpdate: { report: { reporterId: user.id }, publicToReporter: true } }] }) }, select: { objectKey: true, contentType: true } });
   });
 }
 export async function download(actor: Actor, id: string) {
   const item = await privateDownloadItem(actor, id);
   if (!item) throw new AppError('Attachment not found', 404, 'NOT_FOUND');
-  try { return { url: await getSignedUrl(storage(), new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: item.objectKey, ResponseContentDisposition: 'attachment', ResponseContentType: item.contentType }), { expiresIn: 60 }) }; }
+  try { return { url: await getSignedUrl(storage(), new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: item.objectKey, ResponseContentDisposition: 'inline', ResponseContentType: item.contentType }), { expiresIn: 60 }) }; }
   catch { throw unavailable('Downloads'); }
+}
+export async function privateContent(actor: Actor, id: string) {
+  const item = await privateDownloadItem(actor, id);
+  if (!item) throw new AppError('Attachment not found', 404, 'NOT_FOUND');
+  try {
+    const object = await storage().send(new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: item.objectKey }), { abortSignal: AbortSignal.timeout(15000) });
+    if (!object.Body) throw unavailable('Downloads');
+    const bytes = Buffer.from(await object.Body.transformToByteArray());
+    if (!bytes.length || bytes.length > 5 * 1024 * 1024) throw unavailable('Downloads');
+    return { bytes, contentType: item.contentType };
+  } catch (error) { if (error instanceof AppError) throw error; throw unavailable('Downloads'); }
 }
 export async function cleanupUploads() {
   await db().trAttachment.updateMany({ where: { state: 'FINALIZING', expiresAt: { lt: new Date(Date.now() - 3600000) } }, data: { state: 'PENDING' } });
