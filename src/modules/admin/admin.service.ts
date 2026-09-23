@@ -242,7 +242,7 @@ export async function assignTeam(actor: Actor, id: string, body: unknown, client
   const payloadHash = fingerprint({ caseId: id, ...input });
   return client.$transaction(async tx => {
     await lockedActor(tx, actor, true);
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${input.idempotencyKey}, 0))`;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${input.idempotencyKey}, 0))`;
     const existing = await tx.trAssignment.findUnique({ where: { idempotencyKey: input.idempotencyKey }, select: { ...assignmentSelect, payloadHash: true, assigningAdminId: true } });
     if (existing) {
       if (existing.payloadHash !== payloadHash || existing.assigningAdminId !== actor.id) throw new AppError('Assignment key already used for different content', 409, 'IDEMPOTENCY_CONFLICT');
@@ -551,7 +551,7 @@ export async function createOperationalFeature(actor: Actor, body: unknown, clie
   const payloadHash = fingerprint({ actorId: actor.id, ...input });
   return client.$transaction(async tx => {
     await lockedActor(tx, actor, true);
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${input.idempotencyKey}, 0))`;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${input.idempotencyKey}, 0))`;
     const existing = await tx.trAuditLog.findFirst({ where: { actorId: actor.id, action: 'OPERATIONAL_FEATURE_CREATED', details: { path: ['idempotencyKey'], equals: input.idempotencyKey } }, select: { targetId: true, details: true } });
     if (existing) {
       const details = existing.details as Record<string, unknown> | null;
