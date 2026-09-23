@@ -115,14 +115,14 @@ const json = (value: Schema) => ({ 'application/json': { schema: value } });
 const response = (description: string, value: Schema) => ({ description, content: json(value) });
 const cookieSecurity = [{ sessionCookie: [] as string[] }];
 const paths: Record<string, Record<string, unknown>> = {};
-function operation(method: 'get' | 'post' | 'patch', path: string, summary: string, options: { body?: string; query?: Parameter[]; description?: string; status?: number; list?: boolean; data?: Schema; meta?: Schema; capability?: 'canConfirmIncidents' | 'canPublishInformation'; limit?: number; avatarUpload?: boolean } = {}) {
+function operation(method: 'get' | 'post' | 'put' | 'patch', path: string, summary: string, options: { body?: string; query?: Parameter[]; description?: string; status?: number; list?: boolean; data?: Schema; meta?: Schema; capability?: 'canConfirmIncidents' | 'canPublishInformation'; limit?: number; avatarUpload?: boolean; evidenceUpload?: boolean } = {}) {
   const access = path.startsWith('/public/') ? 'public' : path.startsWith('/admin/') ? 'admin' : 'user';
   const data = options.data ?? { description: 'Service result. Fields depend on the selected resource and projection.' };
   const result = options.list ? object({ data: array(data), meta: options.meta ?? ref('PageMeta') }, ['data', 'meta']) : object({ data }, ['data']);
   const parameters: Parameter[] = [...path.matchAll(/\{([^}]+)\}/g)].map(match => ({ name: match[1]!, in: 'path', required: true, schema: schema(z.string().min(1).max(128)) }));
   if (path.includes('{source}')) parameters[0]!.schema = { type: 'string', minLength: 1, maxLength: 128, pattern: '^[Ff][Ii][Rr][Mm][Ss]$', description: 'FIRMS, case-insensitive.' };
   parameters.push(...(options.query ?? []));
-  if (method !== 'get') parameters.push({ name: 'Origin', in: 'header', required: true, schema: string, description: `Must match a configured frontend/backend trusted origin. Content-Type must be ${options.avatarUpload ? 'image/jpeg' : 'application/json'}.` });
+  if (method !== 'get') parameters.push({ name: 'Origin', in: 'header', required: true, schema: string, description: `Must match a configured frontend/backend trusted origin. Content-Type must be ${options.avatarUpload ? 'image/jpeg' : options.evidenceUpload ? 'image/jpeg, image/png or image/webp' : 'application/json'}.` });
   if (options.avatarUpload) parameters.push({ name: 'X-Blazemap-Expected-Updated-At', in: 'header', required: true, schema: dateTime, description: 'Must match the current reviewed user revision.' }, { name: 'X-Blazemap-Audit-Reason', in: 'header', required: true, schema: { type: 'string', minLength: 5, maxLength: 300 }, description: 'Percent-encoded audit reason.' });
   paths[`/api${path}`] ??= {};
   paths[`/api${path}`]![method] = {
@@ -132,13 +132,13 @@ function operation(method: 'get' | 'post' | 'patch', path: string, summary: stri
     'x-access': access, ...(access !== 'public' ? { 'x-roles': access === 'admin' ? ['ADMIN'] : ['USER', 'ADMIN'] } : {}), ...(options.capability ? { 'x-capability': options.capability } : {}),
     security: access === 'public' ? [] : cookieSecurity,
     ...(parameters.length ? { parameters } : {}),
-    ...(options.body ? { requestBody: { required: true, content: json(ref(options.body)) } } : options.avatarUpload ? { requestBody: { required: true, content: { 'image/jpeg': { schema: { type: 'string', format: 'binary' } } } } } : {}),
+    ...(options.body ? { requestBody: { required: true, content: json(ref(options.body)) } } : options.avatarUpload || options.evidenceUpload ? { requestBody: { required: true, content: Object.fromEntries((options.avatarUpload ? ['image/jpeg'] : ['image/jpeg', 'image/png', 'image/webp']).map(type => [type, { schema: { type: 'string', format: 'binary' } }])) } } : {}),
     responses: {
       [options.status ?? 200]: response(options.status === 201 ? 'Created' : 'Success', result),
       '400': response('Invalid request or service validation failed', ref('Error')),
       ...(access !== 'public' ? { '401': response('Missing/invalid session or inactive account', ref('Error')), '403': response('Role, capability, ownership or origin denied', ref('Error')) } : {}),
       '404': response('Resource not found or not visible', ref('Error')),
-      ...(method !== 'get' ? { '409': response('State, revision, idempotency or reference conflict', ref('Error')), '413': response(options.avatarUpload ? 'JPEG exceeds 1 MiB' : 'JSON request exceeds 512 KiB', ref('Error')), '415': response(options.avatarUpload ? 'JPEG request required' : 'JSON request required', ref('Error')) } : {}),
+      ...(method !== 'get' ? { '409': response('State, revision, idempotency or reference conflict', ref('Error')), '413': response(options.avatarUpload ? 'JPEG exceeds 1 MiB' : options.evidenceUpload ? 'Image exceeds 5 MiB' : 'JSON request exceeds 512 KiB', ref('Error')), '415': response(options.avatarUpload ? 'JPEG request required' : options.evidenceUpload ? 'JPEG, PNG or WebP request required' : 'JSON request required', ref('Error')) } : {}),
       '429': response('Rate limit exceeded', ref('Error')),
       '503': response('Database or required integration unavailable', ref('Error')),
       '500': response('Request could not be completed', ref('Error')),
@@ -161,7 +161,8 @@ operation('get', '/reports', 'List own reports', { list: true, query: query(repo
 operation('post', '/reports', 'Create a report', { body: 'ReportInput', status: 201, limit: 30 });
 operation('get', '/reports/{id}', 'Get own report', { description: 'Returns only reports owned by the current actor and updates visible to the reporter.' });
 operation('post', '/reports/{id}/updates', 'Add a report update', { body: 'ReportUpdateInput', status: 201, limit: 30, description: 'USER must own the report; ADMIN may update any report.' });
-operation('post', '/uploads/intents', 'Create an image upload intent', { body: 'UploadIntentInput', data: ref('UploadIntent'), status: 201, limit: 30, description: 'Maximum 30 intents per actor per hour. PUT bytes directly to the returned storage URL within five minutes using the returned headers, then finalize. The intent expires after one hour; this API does not accept multipart uploads.' });
+operation('post', '/uploads/intents', 'Create an image upload intent', { body: 'UploadIntentInput', data: ref('UploadIntent'), status: 201, limit: 30, description: 'Maximum 30 intents per actor per hour. Upload image bytes to the authenticated /uploads/{id}/content endpoint, then finalize. The intent expires after one hour; multipart uploads are not accepted.' });
+operation('put', '/uploads/{id}/content', 'Upload private image bytes through the backend', { evidenceUpload: true, limit: 6, data: object({ id: string }, ['id']), description: 'Only the owner of an unexpired pending upload intent may upload one matching JPEG, PNG or WebP of at most 5 MiB. The server validates the image and forwards it to private storage without browser-to-storage CORS.' });
 operation('post', '/uploads/{id}/finalize', 'Finalize an owned upload', { data: object({ id: string }, ['id']), limit: 30, description: 'No request body is consumed; still send application/json and a trusted Origin. Caller must own the intent, including ADMIN. READY/ATTACHED retries return the ID without reprocessing.' });
 operation('get', '/uploads/{id}/download', 'Get private attachment download URL', { data: ref('Download'), description: 'USER may download owned READY/ATTACHED, unrevoked images; ADMIN may download any eligible image. Returns a URL, not bytes.' });
 operation('get', '/admin/enums', 'Get admin enums', { data: ref('Enums') });

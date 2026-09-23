@@ -47,6 +47,7 @@ router.post('/reports', writes, single((req, res) => reports.createReport(res.lo
 router.get('/reports/:id', single((req, res) => reports.getReport(res.locals.actor as Actor, routeId(req))));
 router.post('/reports/:id/updates', writes, single((req, res) => reports.addReportUpdate(res.locals.actor as Actor, routeId(req), req.body), 201));
 router.post('/uploads/intents', writes, single((req, res) => uploads.createIntent(res.locals.actor as Actor, req.body), 201));
+router.put('/uploads/:id/content', expensive, raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '5mb' }), single((req, res) => uploads.uploadContent(res.locals.actor as Actor, routeId(req), req.body, req.get('Content-Type')?.split(';')[0]?.trim() ?? '')));
 router.post('/uploads/:id/finalize', writes, single((req, res) => uploads.finalize(res.locals.actor as Actor, routeId(req))));
 router.get('/uploads/:id/download', single((req, res) => uploads.download(res.locals.actor as Actor, routeId(req))));
 router.get('/uploads/:id/content', async (req, res) => { const item = await uploads.privateContent(res.locals.actor as Actor, routeId(req)); res.setHeader('Content-Type', item.contentType); res.setHeader('Content-Length', String(item.bytes.length)); res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Cache-Control', 'private, max-age=30'); res.send(item.bytes); });

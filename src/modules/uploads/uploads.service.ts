@@ -25,6 +25,37 @@ export async function createIntent(actor: Actor, body: unknown) {
     return { id: item.id, uploadUrl, method: 'PUT' as const, headers: { 'Content-Type': input.contentType, 'If-None-Match': '*' } };
   } catch { throw unavailable('Uploads'); }
 }
+export async function uploadContent(actor: Actor, id: string, bytes: Buffer, contentType: string) {
+  if (!Buffer.isBuffer(bytes)) throw new AppError('Image bytes are required', 400, 'INVALID_UPLOAD');
+  const item = await db().$transaction(async tx => {
+    await lockedActor(tx, actor);
+    return tx.trAttachment.findFirst({ where: { id, uploaderId: actor.id, state: 'PENDING', expiresAt: { gt: new Date() }, reportId: null, reportUpdateId: null, reportProgressId: null, fieldUpdateId: null, publicationId: null } });
+  });
+  if (!item) throw new AppError('Upload intent is unavailable', 404, 'NOT_FOUND');
+  if (item.contentType !== contentType) throw new AppError('Uploaded type does not match intent', 400, 'INVALID_UPLOAD');
+  if (bytes.length !== item.size) throw new AppError('Uploaded size does not match intent', 400, 'INVALID_UPLOAD');
+  let existing;
+  try { existing = await storage().send(new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: item.stagingKey }), { abortSignal: AbortSignal.timeout(15000) }); }
+  catch (error) {
+    const status = error && typeof error === 'object' && '$metadata' in error ? (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode : undefined;
+    if (status !== 404 && !(error instanceof Error && ['NotFound', 'NoSuchKey'].includes(error.name))) throw unavailable('Uploads');
+  }
+  if (existing) throw new AppError('Upload content already received', 409, 'UPLOAD_CONFLICT');
+  const inspected = await inspectImage(bytes, item.contentType, item.size);
+  const s3 = storage();
+  try {
+    await s3.send(new PutObjectCommand({ Bucket: env.S3_BUCKET, Key: item.stagingKey, Body: bytes, ContentType: item.contentType, ContentLength: bytes.length, IfNoneMatch: '*', Metadata: { sha256: inspected.digest } }), { abortSignal: AbortSignal.timeout(30000) });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'PreconditionFailed') {
+      const existing = await s3.send(new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: item.stagingKey }), { abortSignal: AbortSignal.timeout(15000) });
+      if (existing.Metadata?.sha256 === inspected.digest && existing.ContentLength === bytes.length && existing.ContentType?.split(';')[0] === item.contentType) return { id };
+      throw new AppError('Upload content conflicts with intent', 409, 'UPLOAD_CONFLICT');
+    }
+    if (error instanceof AppError) throw error;
+    throw unavailable('Uploads');
+  }
+  return { id };
+}
 export async function inspectImage(bytes: Buffer, declaredType: string, size: number) {
   if (bytes.length !== size || bytes.length > 5 * 1024 * 1024) throw new AppError('Uploaded image size does not match intent', 400, 'INVALID_UPLOAD');
   const detected = await fileTypeFromBuffer(bytes);
