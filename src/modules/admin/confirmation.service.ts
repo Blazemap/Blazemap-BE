@@ -17,6 +17,7 @@ export type NormalizedVerification = {
   privateReason?: string;
   observationId: string;
   version: number;
+  relatedReportIds: string[];
   perimeter: Polygon;
   boundaryUsesObservationSourceTime: boolean;
   perimeterObservedAt?: string;
@@ -39,6 +40,7 @@ export function normalizeVerification(input: VerificationInput): NormalizedVerif
     privateReason: input.reason,
     observationId: input.fieldUpdateId,
     version: input.version,
+    relatedReportIds: [],
     perimeter: input.perimeter,
     boundaryUsesObservationSourceTime: input.reuseFieldObservation === true,
     perimeterObservedAt: input.perimeterObservedAt,

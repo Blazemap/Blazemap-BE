@@ -151,7 +151,20 @@ export async function verifyCase(actor: Actor, id: string, body: unknown, client
       if (publications) throw new AppError('Withdraw existing public case claims before correcting verification', 409, 'PUBLICATION_REVIEW_REQUIRED');
     }
     const prior = correction ? await tx.trVerification.findFirst({ where: { caseId: id, outcome: { not: 'INCONCLUSIVE' } }, orderBy: { createdAt: 'desc' } }) : null;
-    if (input.outcome === 'CONFIRMED_FIRE') return recordConfirmedCase(tx, {
+    if (input.outcome === 'CONFIRMED_FIRE') {
+      const relatedIds = [...input.relatedReportIds].sort();
+      if (relatedIds.length) {
+        await tx.$queryRaw`SELECT id FROM "TrReport" WHERE id = ANY(${relatedIds}::text[]) ORDER BY id FOR UPDATE`;
+        const reports = await tx.trReport.findMany({ where: { id: { in: relatedIds } }, select: { id: true, caseId: true, reviewStatus: true, locationMode: true }, orderBy: { id: 'asc' } });
+        if (reports.length !== relatedIds.length) throw new AppError('A selected report no longer exists; review the selection', 409, 'REPORT_NOT_FOUND');
+        if (reports.some(report => report.caseId || report.reviewStatus === 'DECLINED' || report.locationMode !== 'INCIDENT_ESTIMATE')) throw new AppError('Only unlinked, non-declined incident reports can be selected', 409, 'REPORT_NOT_ELIGIBLE');
+        const linkedCount = await tx.trReport.count({ where: { caseId: id } });
+        if (linkedCount + relatedIds.length > 100) throw new AppError('This case cannot contain more than 100 reports', 409, 'CASE_REPORT_LIMIT');
+        const linked = await tx.trReport.updateMany({ where: { id: { in: relatedIds }, caseId: null }, data: { caseId: id } });
+        if (linked.count !== relatedIds.length) throw new AppError('Report links changed; refresh and review the selection', 409, 'REPORT_ALREADY_LINKED');
+        for (const reportId of relatedIds) await audit(tx, actor.id, 'REPORT_LINKED', 'REPORT', reportId, input.decisionNote, { caseId: id, confirmation: true });
+      }
+      return recordConfirmedCase(tx, {
       actorId: actor.id,
       current: c,
       observation,
@@ -165,6 +178,7 @@ export async function verifyCase(actor: Actor, id: string, body: unknown, client
       correctedDecisionId: prior?.id ?? null,
       recordOwnerProgress: true,
     });
+    }
     await tx.trVerification.create({ data: { caseId: id, decidingAdminId: actor.id, fieldUpdateId: observation.id, authorityReference: applicationAdminAuthority, outcome: correction ? 'CORRECTION' : input.outcome, previousStatus: c.verificationStatus, newStatus: next, reason: input.privateReason ?? input.decisionNote, correctedDecisionId: prior?.id } });
     const projected = verificationProjection({ verificationStatus: c.verificationStatus, handlingStatus: c.handlingStatus, latitude: c.latitude, longitude: c.longitude }, input.outcome, { latitude: observation.latitude, longitude: observation.longitude });
     const result = await tx.trCase.update({ where: { id, version: input.version }, data: { verificationStatus: projected.verificationStatus, handlingStatus: projected.handlingStatus, latitude: projected.latitude, longitude: projected.longitude, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null }, select: caseSelect });
