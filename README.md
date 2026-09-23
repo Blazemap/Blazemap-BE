@@ -1,33 +1,82 @@
 # Blazemap Backend
 
-The application API for Blazemap's forest and land fire awareness and decision-support system in Kalimantan, Indonesia.
+The application API for Blazemap's forest and land fire awareness and human-review system in Kalimantan, Indonesia. Website served by the separate frontend: [blazemap.my.id](https://blazemap.my.id/). Source code: [Blazemap-BE](https://github.com/Blazemap/Blazemap-BE).
 
-## Purpose
+## What it does
 
-Provides authentication, report and case management, private evidence storage, satellite and weather integrations, and human-reviewed coordination.
+Manages accounts, citizen reports, private evidence, case verification, team assignments, approved publications, and source integrations. NASA FIRMS satellite detections and AI outputs are supporting context, not automatic fire confirmations. Government access and authority to confirm or publish require separately provisioned permissions.
 
-## Tech Stack
+## Technology stack
 
 | Area | Technology |
 | --- | --- |
 | Runtime | Node.js 24, TypeScript |
-| API | Express 5, Zod |
+| API and validation | Express 5, Zod, OpenAPI 3.1 and Swagger UI |
 | Database | PostgreSQL, Prisma 7 |
-| Authentication | Better Auth, Google OAuth |
-| Storage | S3-compatible object storage |
-| Documentation | Swagger UI, OpenAPI 3.1 |
+| Authentication | Better Auth, optional Google OAuth |
+| Media and notifications | S3-compatible private storage, SMTP |
+| Context sources | NASA FIRMS, Google Weather, Photon place search, OpenStreetMap, internal AI service |
 
-API reference: `/api/docs` · OpenAPI document: `/api/openapi.json`.
+## Installation and local development
 
-## Related Repositories
+Prerequisites: Node.js 24, npm, PostgreSQL, and a separate [frontend](https://github.com/Blazemap/Blazemap-FE) if you need to use the browser UI.
 
-[Organization](https://github.com/Blazemap) · [Frontend](https://github.com/Blazemap/Blazemap-FE) · [AI](https://github.com/Blazemap/Blazemap-AI)
+```bash
+npm ci
+```
 
-Government access and operational authority require separately provisioned permissions.
+Copy `.env.example` to `.env` and fill in the values required for the features you intend to use. For a working local API, configure `DATABASE_URL`, `BETTER_AUTH_SECRET` (at least 32 characters), `BETTER_AUTH_URL` (for example `http://localhost:3000`), and `FRONTEND_URL` (your frontend origin). Email/password registration and reset additionally require SMTP delivery; Google sign-in requires both Google OAuth credentials. Production application origins must use HTTPS. Do not commit `.env`, database certificates, access keys, or credentials.
+
+| Feature | Additional configuration |
+| --- | --- |
+| Verified PostgreSQL TLS / container runtime | `DATABASE_CA_PEM` (required by `docker-entrypoint.sh`) |
+| FIRMS ingestion and assessed triage | `FIRMS_MAP_KEY`, `FIRMS_PRODUCTS`, `FIRMS_AREA`; explicitly configured `TRIAGE_HOTSPOT_RADIUS_METERS`, `TRIAGE_HOTSPOT_WINDOW_HOURS`, `TRIAGE_SETTLEMENT_RADIUS_METERS` |
+| On-demand case weather | `GOOGLE_MAPS_SERVER_KEY`; optional `PROVIDER_TIMEOUT_MS` |
+| AI analysis | `AI_SERVICE_URL` and matching `AI_SERVICE_TOKEN` from the AI service; optional `AI_AUTO_REANALYZE` |
+| Private uploads | `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`; optional `S3_ENDPOINT`, `S3_FORCE_PATH_STYLE` |
+| Email delivery | `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`; `SMTP_PASSWORD` if `SMTP_USER` is set |
+| Spatial import | `SPATIAL_IMPORT_USER_AGENT` with operator contact; optional `OSM_GEOFABRIK_URL` |
+
+`src/config/env.ts` documents the complete runtime configuration, including optional `PHOTON_URL`, `AI_COORDINATE_PRECISION_DECIMALS`, and server/proxy settings. Missing provider credentials leave their respective features unavailable; they do not turn uncertain evidence into a verified result.
+
+Review the migration SQL and use a disposable database first. When the target database is ready, apply migrations deliberately (this command changes the database):
+
+```bash
+npm run db:deploy
+npm run db:generate
+npm run dev
+```
+
+`npm run dev` runs the API at `http://localhost:3000` unless `PORT` is changed. `GET /health` returns 503 when the database is not ready; `GET /api/public/status` exposes public service status. Do not run provisioning, seed, sync, import, or cleanup commands as part of routine installation: those are separate operational actions that may write data or call external services.
+
+## Development commands
+
+| Command | Purpose |
+| --- | --- |
+| `npm run dev` | Start the development API with `tsx watch` |
+| `npm run lint` | Check source and configured tests with ESLint |
+| `npm run typecheck` | Check TypeScript without emitting files |
+| `npm test` | Run the repository's check scripts |
+| `npm run db:validate` | Validate the Prisma schema without migrating |
+| `npm run build` | Generate the Prisma client and compile to `dist/` |
+| `npm start` | Run the compiled API |
+
+## Technical documentation
+
+- `src/app.ts` sets up security headers, CORS, rate limits, database readiness, authentication, and the `/api` router. `src/modules/api/api.routes.ts` lists public, signed-in user, and admin-only endpoints.
+- The local reference-only Swagger UI is at `http://localhost:3000/api/docs`; OpenAPI 3.1 JSON is at `http://localhost:3000/api/openapi.json`. The Swagger UI does not execute write requests.
+- `src/config/auth.ts` configures verified-email cookie sessions, optional Google identity, and role/capability defaults. Google sign-in does not grant admin authority.
+- `prisma/schema.prisma` and `prisma/migrations/` hold the database model and migration history. `src/modules/reports/triage.ts` evaluates report context; `src/modules/admin/` handles case decisions, operations, and publication approvals.
+- `src/modules/integrations/` handles FIRMS ingestion, Google Weather, and AI analysis. `src/modules/uploads/` enforces access to media; `src/modules/spatial/` handles spatial ingestion.
+- `Dockerfile` builds with Node.js 24. The runtime entrypoint requires `DATABASE_URL` and `DATABASE_CA_PEM` and starts the API on port 3000; it does **not** apply database migrations automatically.
+
+## Related repositories
+
+[Organization](https://github.com/Blazemap) · [Frontend](https://github.com/Blazemap/Blazemap-FE) · [AI service](https://github.com/Blazemap/Blazemap-AI)
 
 ## Report triage and confirmed perimeters
 
-All routes below have `/api` prefix and retain existing session, origin and permission checks. Migration `20260917000000_confirmed_perimeter` adds four case columns and the publication enum value only. It is intentionally not applied by this change; review and deploy it separately before running the updated API. No backfill, reset or automatic publication occurs.
+All routes below have an `/api` prefix and retain existing session, origin, and permission checks. The confirmed-perimeter migration is in `prisma/migrations/`; its deployment status depends on the target database. Review migration history and SQL before applying any migrations. No perimeter update automatically publishes a case.
 
 ### Admin report triage
 
@@ -54,7 +103,7 @@ Explicit positive finite environment values are required for `TRIAGE_HOTSPOT_RAD
 - MEDIUM: neither match, with complete proven spatial/time coverage for both sources and no invalid/truncated context.
 - UNKNOWN: insufficient coverage; no detections never implies safety.
 
-`missingData` remains populated on CRITICAL/HIGH when coverage is missing. Codes: the three environment names, `INCIDENT_COORDINATES`, `OBSERVATION_TIME`, `SATELLITE_COVERAGE`, `SETTLEMENT_COVERAGE`, `SETTLEMENT_GEOMETRY`, `TRUNCATED_CONTEXT`. `reasonCodes`: `POLICY_NOT_CONFIGURED`, `DEMO_EXCLUDED`, `INCIDENT_LOCATION_UNKNOWN`, `OBSERVATION_TIME_INVALID`, `SATELLITE_SPATIOTEMPORAL_MATCH`, `SETTLEMENT_NEARBY`, `COVERED_NO_NEARBY_MATCH`, `INSUFFICIENT_COVERAGE`.
+`missingData` remains populated on CRITICAL/HIGH when coverage is missing. Codes include the three environment names, `INCIDENT_COORDINATES`, `OBSERVATION_TIME`, `SATELLITE_COVERAGE`, `SETTLEMENT_COVERAGE`, and `SETTLEMENT_GEOMETRY`. `reasonCodes` include `POLICY_NOT_CONFIGURED`, `DEMO_EXCLUDED`, `INCIDENT_LOCATION_UNKNOWN`, `OBSERVATION_TIME_INVALID`, `SATELLITE_SPATIOTEMPORAL_MATCH`, `SETTLEMENT_NEARBY`, `COVERED_NO_NEARBY_MATCH`, and `INSUFFICIENT_COVERAGE`. If source context exceeds the query safety caps, the endpoint returns 503 `TRIAGE_CONTEXT_TOO_LARGE` instead of a partial assessment.
 
 Successful FIRMS runs now record `scope.observedFrom`/`observedTo` alongside existing `area` and `products`. Only a currently configured FIRMS source with its latest terminal run successful within one hour can establish negative coverage. Its box must cover the full search radius and its recorded time interval the full symmetric window. Legacy runs without explicit time bounds, failed/stale runs and historical gaps cannot establish MEDIUM. Positive spatial/time matches remain usable independently of negative coverage.
 
@@ -64,7 +113,7 @@ Settlement negative coverage requires a verified, non-DEMO SETTLEMENT layer with
 { bbox: [west, south, east, north], validFrom: ISO8601, validTo: ISO8601, complete: true }
 ```
 
-The box must contain the entire settlement search radius; dates must cover the report and remain current, and sourceDate must not postdate the report. Free-text regional labels, mere feature presence, and region membership do not prove coverage. Valid nearby settlements can establish HIGH without complete negative coverage. Unsupported/malformed Polygon geometry is ignored as evidence and prevents MEDIUM. Query safety caps are 10,000 hotspots, 10,000 settlements and 1,000 layers; detected truncation prevents MEDIUM.
+The box must contain the entire settlement search radius; dates must cover the report and remain current, and sourceDate must not postdate the report. Free-text regional labels, mere feature presence, and region membership do not prove coverage. Valid nearby settlements can establish HIGH without complete negative coverage. Unsupported/malformed Polygon geometry is ignored as evidence and prevents MEDIUM. Query safety caps are 10,000 hotspots, 10,000 settlements and 1,000 layers; exceeding a cap returns 503 without a partial assessment.
 
 ### Confirmed perimeter PATCH
 
@@ -105,11 +154,9 @@ publicPerimeter: {
 
 Later private perimeter/point edits cannot change published geometry. Invalid/legacy snapshots omit publicPerimeter; other modes never expose it. Existing point/withheld behavior and publication withdrawal/expiry filters remain unchanged. Field updates continue through `POST /admin/cases/:id/field-updates`, verification through `POST /admin/cases/:id/verify`.
 
-## BMKG forecast runtime
+## Current weather and source synchronization
 
-BMKG synchronization is a one-shot command for a dedicated UTC Railway cron service: `node dist/sync.js BMKG`, scheduled with `0 */6 * * *`. The long-running `dist/watch.js` process polls FIRMS only. `BMKG_POLL_INTERVAL_MS=21600000` is the six-hour freshness guard and should match the cron interval.
-
-A BMKG sync processes only verified administrative level IV regions with stored ADM4 codes and active cases. Cases with coordinates but no selected region remain unmapped; coordinates are never converted to ADM4 without an imported, verified boundary dataset. Operators select a verified mapping through `PATCH /admin/cases/:id/forecast-region`.
+Case weather is requested on demand at case coordinates using the configured Google Weather provider. Without a valid provider key or case coordinates, current weather and downwind attention remain unavailable; they are not inferred from historical forecasts. The `sources:sync` command and source watcher currently support FIRMS ingestion, not a BMKG cron or forecast-region selection workflow. Review the requested source and environment before running a sync against any database.
 
 ## OpenStreetMap spatial ingestion
 
@@ -119,4 +166,4 @@ The import stores only tagged settlement, facility, and water-source nodes plus 
 
 For a dedicated Railway cron service, use start command `node dist/spatial-sync.js`, UTC schedule `0 3 * * *`, one replica, and limits no higher than 1 CPU and 1 GB memory. Configure `DATABASE_URL`, `DATABASE_CA_PEM`, and `SPATIAL_IMPORT_USER_AGENT=Blazemap/1.0 (+https://blazemap.my.id)`. Do not enable the schedule until the dry run passes; the first full production import is intentionally operator-controlled.
 
-Owner notifications are factual information alerts only. A linked active case can create one idempotent notification per stored forecast and report when the current regional forecast changes wind direction by at least 45 degrees, changes rain context, or crosses explicitly configured `BMKG_NOTIFY_WIND_SPEED_KMH` / `BMKG_NOTIFY_HUMIDITY_PERCENT` thresholds. The threshold variables have no defaults. No first forecast creates a change alert. Notifications are limited to report owners and never imply live sensing, fire confirmation, spread perimeter, arrival time, warning, evacuation or operational instruction.
+Notification and publication behavior is governed by the current implementation under `src/modules/notifications/` and `src/modules/admin/`. Do not treat notifications, weather context, or AI suggestions as official warnings, fire confirmations, arrival-time predictions, or evacuation instructions.

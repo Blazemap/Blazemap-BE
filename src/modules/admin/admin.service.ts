@@ -72,6 +72,25 @@ export async function createCase(actor: Actor, body: unknown) {
     return c;
   });
 }
+export async function lockRelatedReports(tx: Transaction, reportIds: string[]) {
+  if (!reportIds.length) return;
+  const ids = [...reportIds].sort();
+  await tx.$queryRaw`SELECT id FROM "TrReport" WHERE id = ANY(${ids}::text[]) ORDER BY id FOR UPDATE`;
+}
+
+export async function linkRelatedReports(tx: Transaction, actorId: string, caseId: string, reportIds: string[], reason: string) {
+  if (!reportIds.length) return;
+  const ids = [...reportIds].sort();
+  await lockRelatedReports(tx, ids);
+  const reports = await tx.trReport.findMany({ where: { id: { in: ids } }, select: { id: true, caseId: true, reviewStatus: true, locationMode: true, latitude: true, longitude: true }, orderBy: { id: 'asc' } });
+  if (reports.length !== ids.length) throw new AppError('A selected report no longer exists; review the selection', 409, 'REPORT_NOT_FOUND');
+  if (reports.some(report => report.caseId || report.reviewStatus !== 'REVIEWED' || report.locationMode !== 'INCIDENT_ESTIMATE' || report.latitude === null || report.longitude === null)) throw new AppError('Only unlinked, reviewed incident reports can be selected', 409, 'REPORT_NOT_ELIGIBLE');
+  if (await tx.trReport.count({ where: { caseId } }) + ids.length > 100) throw new AppError('This case cannot contain more than 100 reports', 409, 'CASE_REPORT_LIMIT');
+  const linked = await tx.trReport.updateMany({ where: { id: { in: ids }, caseId: null }, data: { caseId } });
+  if (linked.count !== ids.length) throw new AppError('Report links changed; refresh and review the selection', 409, 'REPORT_ALREADY_LINKED');
+  for (const reportId of ids) await audit(tx, actorId, 'REPORT_LINKED', 'REPORT', reportId, reason, { caseId, confirmation: true });
+}
+
 export async function updateCase(actor: Actor, id: string, body: unknown, client: PrismaClient = db()) {
   const input = casePatchSchema.parse(body);
   return client.$transaction(async tx => {
@@ -81,12 +100,14 @@ export async function updateCase(actor: Actor, id: string, body: unknown, client
       const verified = await tx.msUser.findUnique({ where: { id: user.id }, select: { emailVerified: true } });
       if (!verified?.emailVerified) throw new AppError('Verified administrator required', 403, 'FORBIDDEN');
     }
+    if ('perimeter' in input) await lockRelatedReports(tx, input.relatedReportIds);
     await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${id} FOR UPDATE`;
     const c = await tx.trCase.findUniqueOrThrow({ where: { id } });
     assertVersion(c.version, input.version);
     assertCaseOpen(c);
     if ('perimeter' in input) {
       if (c.verificationStatus !== 'CONFIRMED_FIRE') throw new AppError('Perimeter requires a confirmed fire', 409, 'INVALID_TRANSITION');
+      await linkRelatedReports(tx, actor.id, id, input.relatedReportIds, input.reporterMessage);
       const data = await tx.trCase.update({ where: { id, version: input.version }, data: { perimeter: jsonValue(input.perimeter), perimeterObservedAt: new Date(input.perimeterObservedAt), perimeterSource: input.perimeterSource, perimeterRevision: { increment: 1 }, version: { increment: 1 }, contextRevision: { increment: 1 }, latestAnalysisId: null }, select: { ...caseSelect, perimeter: true, perimeterObservedAt: true, perimeterSource: true, perimeterRevision: true } });
       await audit(tx, actor.id, 'CASE_PERIMETER_UPDATED', 'CASE', id, input.reason, { authorityReference: input.authorityReference, authorityBasis: 'APPLICATION_ADMIN_ROLE', authorityNoteSource: 'OPERATOR_SUPPLIED', before: { perimeter: c.perimeter, observedAt: c.perimeterObservedAt, source: c.perimeterSource, revision: c.perimeterRevision }, after: { perimeter: data.perimeter, observedAt: data.perimeterObservedAt, source: data.perimeterSource, revision: data.perimeterRevision }, areaHectares: areaHectares(input.perimeter) });
       await recordCaseProgress(tx, id, actor.id, 'CASE_REVISION', input.reporterMessage);
@@ -135,6 +156,7 @@ export async function verifyCase(actor: Actor, id: string, body: unknown, client
   return client.$transaction(async tx => {
     await lockNearbyWorkflow(tx);
     await lockedActor(tx, actor, true, 'canConfirmIncidents');
+    if (input.outcome === 'CONFIRMED_FIRE') await lockRelatedReports(tx, input.relatedReportIds);
     await tx.$queryRaw`SELECT id FROM "TrCase" WHERE id = ${id} FOR UPDATE`;
     const c = await tx.trCase.findUniqueOrThrow({ where: { id } });
     assertVersion(c.version, input.version);
@@ -152,18 +174,7 @@ export async function verifyCase(actor: Actor, id: string, body: unknown, client
     }
     const prior = correction ? await tx.trVerification.findFirst({ where: { caseId: id, outcome: { not: 'INCONCLUSIVE' } }, orderBy: { createdAt: 'desc' } }) : null;
     if (input.outcome === 'CONFIRMED_FIRE') {
-      const relatedIds = [...input.relatedReportIds].sort();
-      if (relatedIds.length) {
-        await tx.$queryRaw`SELECT id FROM "TrReport" WHERE id = ANY(${relatedIds}::text[]) ORDER BY id FOR UPDATE`;
-        const reports = await tx.trReport.findMany({ where: { id: { in: relatedIds } }, select: { id: true, caseId: true, reviewStatus: true, locationMode: true }, orderBy: { id: 'asc' } });
-        if (reports.length !== relatedIds.length) throw new AppError('A selected report no longer exists; review the selection', 409, 'REPORT_NOT_FOUND');
-        if (reports.some(report => report.caseId || report.reviewStatus === 'DECLINED' || report.locationMode !== 'INCIDENT_ESTIMATE')) throw new AppError('Only unlinked, non-declined incident reports can be selected', 409, 'REPORT_NOT_ELIGIBLE');
-        const linkedCount = await tx.trReport.count({ where: { caseId: id } });
-        if (linkedCount + relatedIds.length > 100) throw new AppError('This case cannot contain more than 100 reports', 409, 'CASE_REPORT_LIMIT');
-        const linked = await tx.trReport.updateMany({ where: { id: { in: relatedIds }, caseId: null }, data: { caseId: id } });
-        if (linked.count !== relatedIds.length) throw new AppError('Report links changed; refresh and review the selection', 409, 'REPORT_ALREADY_LINKED');
-        for (const reportId of relatedIds) await audit(tx, actor.id, 'REPORT_LINKED', 'REPORT', reportId, input.decisionNote, { caseId: id, confirmation: true });
-      }
+      await linkRelatedReports(tx, actor.id, id, input.relatedReportIds, input.decisionNote);
       return recordConfirmedCase(tx, {
       actorId: actor.id,
       current: c,
@@ -353,7 +364,7 @@ export async function monitoringSummary() {
     db().trCase.count({ where: { verificationStatus: 'UNVERIFIED', handlingStatus: { not: 'CLOSED' } } }),
     db().trCase.count({ where: { verificationStatus: 'CONFIRMED_FIRE', handlingStatus: { not: 'CLOSED' } } }),
     db().trCase.count({ where: { handlingStatus: { in: ['ON_SCENE', 'RESPONDING', 'MONITORING'] } } }),
-    db().trCase.count({ where: { priority: 'HIGH', handlingStatus: { not: 'CLOSED' } } }),
+    db().trCase.count({ where: { priority: { in: ['HIGH', 'CRITICAL'] }, handlingStatus: { not: 'CLOSED' } } }),
     db().trCase.groupBy({ by: ['verificationStatus'], _count: { _all: true } }),
     db().trCase.groupBy({ by: ['handlingStatus'], _count: { _all: true } }),
     db().trCase.groupBy({ by: ['priority'], where: { handlingStatus: { not: 'CLOSED' } }, _count: { _all: true } }),
