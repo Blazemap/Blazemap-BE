@@ -156,7 +156,6 @@ export async function publishCompletionReport(actor: Actor, id: string, body: un
     if (item.updatedAt.getTime() !== Date.parse(input.expectedUpdatedAt)) throw new AppError('Draft changed; reload and review before publishing', 409, 'PUBLICATION_CONFLICT');
     if (!item.bodyRich) throw new AppError('A validated rich-text body is required', 400, 'INVALID_BODY');
     if (!Array.isArray(item.sources) || !item.sources.length) throw new AppError('Add at least one factual HTTPS source before publishing', 400, 'SOURCES_REQUIRED');
-    if (item.validUntil && item.validUntil <= new Date()) throw new AppError('Expiry must be in the future', 400, 'INVALID_VALIDITY');
     if (!item.privacyReview?.trim()) throw new AppError('Confirm the privacy review before publishing', 400, 'PRIVACY_REVIEW_REQUIRED');
     await validateRegions(tx, item.regions.map(region => region.regionId));
     const caseId = item.caseId;
@@ -176,7 +175,9 @@ export async function publishCompletionReport(actor: Actor, id: string, body: un
       const old = await tx.trPublicInformation.updateMany({ where: { id: item.supersedesId, status: 'PUBLISHED' }, data: { status: 'SUPERSEDED', updatedAt: new Date() } });
       if (!old.count) throw new AppError('The News being updated is no longer current', 409, 'PUBLICATION_CONFLICT');
     }
-    const updated = await tx.trPublicInformation.update({ where: { id, status: 'DRAFT', updatedAt: item.updatedAt }, data: { status: 'PUBLISHED', outcome: incident.verificationStatus === 'CONFIRMED_FIRE' ? 'CONFIRMED' : null, publisherId: actor.id, authorityReference: applicationAdminAuthority, publishedAt: new Date(), updatedAt: nextPublicationTimestamp(item.updatedAt), publicCaseSnapshot: snapshot }, select: reportPublicationSelect() });
+    const publishedAt = new Date();
+    if (item.validUntil && item.validUntil <= publishedAt) throw new AppError('Expiry must be in the future', 400, 'INVALID_VALIDITY');
+    const updated = await tx.trPublicInformation.update({ where: { id, status: 'DRAFT', updatedAt: item.updatedAt }, data: { status: 'PUBLISHED', outcome: incident.verificationStatus === 'CONFIRMED_FIRE' ? 'CONFIRMED' : null, publisherId: actor.id, authorityReference: applicationAdminAuthority, publishedAt, updatedAt: nextPublicationTimestamp(item.updatedAt), publicCaseSnapshot: snapshot }, select: reportPublicationSelect() });
     await audit(tx, actor.id, item.supersedesId ? 'CASE_REPORT_UPDATED' : 'CASE_REPORT_PUBLISHED', 'PUBLICATION', id, undefined, { caseId: incident.id, caseVersion: incident.version, reviewedUpdatedAt: item.updatedAt.toISOString(), supersedesId: item.supersedesId, authorityBasis: applicationAdminAuthority });
     await evaluateNearby(tx, undefined, id);
     if (incident.verificationStatus === 'CONFIRMED_FIRE') await notifyNearbyCompletion(tx, incident.id, id, item.summary);

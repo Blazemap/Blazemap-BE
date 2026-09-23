@@ -1,10 +1,15 @@
 import { db, emailAvailable, env, sendEmail } from '../../config/index.js';
 import type { PrismaClient } from '../../generated/prisma/client.js';
+import type { Transaction } from '../../types/index.js';
+
+export async function lockNotificationEmailWorkflow(tx: Transaction) {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(724819321)`;
+}
 
 export async function deliverNotificationEmails(client: PrismaClient = db()) {
   if (!emailAvailable || !env.FRONTEND_URL) return { delivered: 0, failed: 0 };
   const claimed = await client.$transaction(async tx => {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(724819321)`;
+    await lockNotificationEmailWorkflow(tx);
     const now = new Date();
     const staleClaim = new Date(now.getTime() - 10 * 60_000);
     const rows = await tx.trNotification.findMany({ where: { emailRequested: true, emailSentAt: null, emailAttempts: { lt: 5 }, OR: [{ emailClaimedAt: null }, { emailClaimedAt: { lt: staleClaim } }], user: { active: true, emailVerified: true } }, select: { id: true, title: true, message: true, caseId: true, publication: { select: { slug: true } }, user: { select: { email: true } } }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], take: 20 });

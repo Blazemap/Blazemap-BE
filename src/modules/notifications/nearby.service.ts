@@ -6,7 +6,7 @@ import { geometryDistanceMeters, publicPerimeter } from '../../utils/geometry.js
 import { fingerprint } from '../../utils/index.js';
 
 export async function lockNearbyWorkflow(tx: Transaction) {
-  await tx.$queryRaw`SELECT pg_advisory_xact_lock(724819320)`;
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(724819320)`;
 }
 
 export const nearbyLocationSchema = z.discriminatedUnion('enabled', [

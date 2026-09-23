@@ -117,7 +117,6 @@ export async function publishInformation(actor: Actor, id: string, body: unknown
     if (item.status !== 'DRAFT') throw new AppError('Only drafts can be published', 409, 'INVALID_PUBLICATION_STATE');
     assertPublicationRevision(item.updatedAt, input.expectedUpdatedAt);
     if (!Array.isArray(item.sources) || !item.sources.length) throw new AppError('At least one factual source is required', 400, 'SOURCES_REQUIRED');
-    if (item.validUntil && item.validUntil <= new Date()) throw new AppError('Validity must end after publication', 400, 'INVALID_VALIDITY');
     await validateRegions(tx, item.regions.map(v => v.regionId));
     if (item.outcome) {
       if (!item.privacyReview?.trim()) throw new AppError('News requires explicit privacy review', 400, 'PRIVACY_REVIEW_REQUIRED');
@@ -150,7 +149,9 @@ export async function publishInformation(actor: Actor, id: string, body: unknown
       const old = await tx.trPublicInformation.updateMany({ where: { id: item.supersedesId, status: 'PUBLISHED' }, data: { status: 'SUPERSEDED', updatedAt: new Date() } });
       if (!old.count) throw new AppError('The publication being replaced is no longer current', 409, 'PUBLICATION_CONFLICT');
     }
-    const updated = await tx.trPublicInformation.update({ where: { id, status: 'DRAFT', updatedAt: new Date(input.expectedUpdatedAt) }, data: { status: 'PUBLISHED', publisherId: actor.id, authorityReference: input.authorityReference, updatedAt: nextPublicationTimestamp(item.updatedAt), publishedAt: new Date(), publicCaseSnapshot: snapshot }, select: publicationSelect() });
+    const publishedAt = new Date();
+    if (item.validUntil && item.validUntil <= publishedAt) throw new AppError('Validity must end after publication', 400, 'INVALID_VALIDITY');
+    const updated = await tx.trPublicInformation.update({ where: { id, status: 'DRAFT', updatedAt: new Date(input.expectedUpdatedAt) }, data: { status: 'PUBLISHED', publisherId: actor.id, authorityReference: input.authorityReference, updatedAt: nextPublicationTimestamp(item.updatedAt), publishedAt, publicCaseSnapshot: snapshot }, select: publicationSelect() });
     await audit(tx, actor.id, 'INFORMATION_PUBLISHED', 'PUBLICATION', id, input.authorityReference, { reviewedUpdatedAt: item.updatedAt.toISOString(), authorityBasis: 'APPLICATION_ADMIN_ROLE', authorityNoteSource: 'OPERATOR_SUPPLIED' });
     await evaluateNearby(tx, undefined, id);
     if (item.caseId && item.outcome === 'CONFIRMED') await notifyNearbyCompletion(tx, item.caseId, id, item.summary);

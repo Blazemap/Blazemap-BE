@@ -31,7 +31,7 @@ export const originGuard: RequestHandler = (req, _res, next) => {
   }
   next();
 };
-export const errorHandler: ErrorRequestHandler = (error: unknown, _req, res, _next) => {
+export const errorHandler: ErrorRequestHandler = (error: unknown, req, res, _next) => {
   if (error instanceof z.ZodError) { res.status(400).json({ message: 'Validation failed', code: 'VALIDATION_ERROR', errors: error.issues.map(i => ({ path: i.path.join('.'), message: i.message })) }); return; }
   if (error instanceof AppError) { res.status(error.status).json({ message: error.message, code: error.code, ...(error.errors ? { errors: error.errors } : {}) }); return; }
   const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
@@ -42,5 +42,6 @@ export const errorHandler: ErrorRequestHandler = (error: unknown, _req, res, _ne
   if (['P1000', 'P1001', 'P1002', 'P1017', 'P2021', 'P2022', 'P2024', 'ECONNREFUSED', 'ETIMEDOUT', '42P01'].includes(code)) { res.status(503).json({ message: 'Database unavailable', code: 'SERVICE_UNAVAILABLE' }); return; }
   if (error instanceof SyntaxError) { res.status(400).json({ message: 'Invalid JSON request', code: 'INVALID_JSON' }); return; }
   const status = error && typeof error === 'object' && 'status' in error ? Number(error.status) : 500;
+  if (status !== 413) console.error('Unhandled request failure', { method: req.method, route: req.route?.path ?? 'unmatched', name: error instanceof Error ? error.name : 'Unknown', code: /^[A-Z0-9_]+$/.test(code) ? code : 'UNKNOWN' });
   res.status(status === 413 ? 413 : 500).json({ message: status === 413 ? 'Request too large' : 'Request could not be completed', code: status === 413 ? 'PAYLOAD_TOO_LARGE' : 'INTERNAL_ERROR' });
 };

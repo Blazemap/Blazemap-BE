@@ -78,7 +78,7 @@ export async function warningAction(actor: Actor, id: string, body: unknown, cli
     if (input.action === 'publish') {
       if (await tx.trAttachment.count({ where: { publicationId: id, approvedAt: { not: null }, revokedAt: null } })) throw new AppError('Warning workflow supports reviewed text and operational references only', 409, 'WARNING_MEDIA_UNSUPPORTED');
       publicationSchema.parse({ title: item.title, summary: item.summary, body: item.body, type: 'WARNING', sources: item.sources, regionIds: item.regions.map(r => r.regionId), publicLocationMode: 'REGION_ONLY' });
-      if (!item.validUntil || item.validUntil <= new Date() || !Array.isArray(item.sources) || !item.sources.length || !item.regions.length) throw new AppError('Warning needs future validity, sources and affected regions', 400, 'INVALID_WARNING');
+      if (!item.validUntil || !Array.isArray(item.sources) || !item.sources.length || !item.regions.length) throw new AppError('Warning needs future validity, sources and affected regions', 400, 'INVALID_WARNING');
       for (const region of item.regions) await verifiedRegion(tx, region.regionId);
       const snapshot = warningSnapshotSchema.parse(item.publicCaseSnapshot);
       const current = await references(tx, snapshot.operationalReferences.map(r => ({ featureId: r.featureId, updateId: r.updateId })));
@@ -88,7 +88,9 @@ export async function warningAction(actor: Actor, id: string, body: unknown, cli
         if (!changed.count) throw new AppError('Warning being replaced is no longer current', 409, 'PUBLICATION_CONFLICT');
       }
     }
-    const updated = await tx.trPublicInformation.update({ where: { id }, data: { updatedAt: nextPublicationTimestamp(item.updatedAt), ...(input.action === 'publish' ? { status: 'PUBLISHED', publishedAt: new Date(), publisherId: actor.id, authorityReference: input.authorityReference } : { status: 'WITHDRAWN', withdrawalReason: input.reason }) }, select: publicationSelect() });
+    const publishedAt = input.action === 'publish' ? new Date() : null;
+    if (publishedAt && (!item.validUntil || item.validUntil <= publishedAt)) throw new AppError('Warning needs future validity, sources and affected regions', 400, 'INVALID_WARNING');
+    const updated = await tx.trPublicInformation.update({ where: { id }, data: { updatedAt: nextPublicationTimestamp(item.updatedAt), ...(publishedAt ? { status: 'PUBLISHED', publishedAt, publisherId: actor.id, authorityReference: input.authorityReference } : { status: 'WITHDRAWN', withdrawalReason: input.reason }) }, select: publicationSelect() });
     await audit(tx, actor.id, 'WARNING_COMMAND', 'PUBLICATION', id, input.reason ?? input.authorityReference, { idempotencyKey: input.idempotencyKey, payloadHash: hash, action: input.action, reviewedUpdatedAt: input.expectedUpdatedAt, explicitApproval: true, authorityBasis: 'APPLICATION_ADMIN_ROLE', advisoryKind: 'INFORMATIONAL_ADVISORY' });
     return publicationDto(updated);
   });
